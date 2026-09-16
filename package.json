@@ -1,0 +1,42 @@
+{
+  "name": "dsh-opencode-zen",
+  "description": "OpenCode Zen free models + x-opencode-session header fix for DeepSeek Harness.",
+  "version": "0.2.0",
+  "type": "commonjs",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaozhe7772222/dsh-opencode-zen.git"
+  },
+  "homepage": "https://github.com/xiaozhe7772222/dsh-opencode-zen",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "opencode",
+    "zen",
+    "free",
+    "llm",
+    "provider"
+  ]
+}
