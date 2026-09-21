@@ -1,7 +1,7 @@
 {
   "name": "dsh-opencode-zen",
-  "description": "OpenCode Zen free models + x-opencode-session header fix for DeepSeek Harness.",
-  "version": "0.2.0",
+  "description": "OpenCode Zen free models + CLI disguise headers for DeepSeek Harness. Bypasses FreeTierError since 2026-09-16.",
+  "version": "0.3.0",
   "type": "commonjs",
   "main": "lib/index.js",
   "exports": {
@@ -27,9 +27,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/xiaozhe7772222/dsh-opencode-zen.git"
+    "url": "https://github.com/kyomufs/dsh-opencode-zen.git"
   },
-  "homepage": "https://github.com/xiaozhe7772222/dsh-opencode-zen",
+  "homepage": "https://github.com/kyomufs/dsh-opencode-zen",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -37,6 +37,8 @@
     "zen",
     "free",
     "llm",
-    "provider"
+    "provider",
+    "disguise",
+    "cli-headers"
   ]
 }
