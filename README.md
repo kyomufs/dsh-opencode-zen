@@ -1,29 +1,30 @@
 # dsh-opencode-zen
 
-**Six free LLMs for DeepSeek Harness, zero config, zero cost.** Brings the OpenCode Zen free tier into your DSH model picker — no signup, no API key, no billing.
+**Seven free LLMs for DeepSeek Harness, zero config, zero cost.** Brings the OpenCode Zen free tier into your DSH model picker — no signup, no API key, no billing.
 
 ---
 
 ## Why?
 
 - **Actually free** — the official free tier authenticates with the literal key `public`; no account, no signup, no API key.
-- **Six free models** — DeepSeek V4 Flash, Xiaomi MiMo, Tencent Hunyuan, two NVIDIA Nemotrons, and Laguna S 2.1.
+- **Seven free models** — Ling 3.0 Flash, two Xiaomi MiMo versions, two Muse Spark contributors, and two NVIDIA Nemotrons.
 - **Install & go** — restart `dsh web` and the `opencode` route appears in the model selector; no configuration needed.
 - **CLI disguise** — requests carry the same headers as the official OpenCode CLI (x-opencode-client, session IDs, gate tools), bypassing the FreeTierError introduced on 2026-09-16.
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
 
-## Models (6 free models)
+## Models (7 free models)
 
 | Model | Context window | Notes |
 |---|---|---|
-| `deepseek-v4-flash-free` | 200k | DeepSeek V4 Flash · reasoning + tool calls, daily driver |
+| `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
 | `mimo-v2.5-free` | 200k | Xiaomi MiMo 2.5 |
-| `hy3-free` | 200k | Tencent Hunyuan |
+| `mimo-v2.6-flash-free` | 200k | Xiaomi MiMo 2.6 Flash |
+| `muse-spark-1.2-contributor-free` | 200k | Muse Spark 1.2 Contributor |
+| `muse-spark-1.3-contributor-free` | 200k | Muse Spark 1.3 Contributor |
 | `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
 | `nemotron-3.5-lightning-free` | 131,072 | NVIDIA Nemotron 3.5 Lightning |
-| `laguna-s-2.1-free` | 200k | Laguna S 2.1 |
 
 Reasoning effort: `off` / `low` / `high` (default) / `max`.
 
@@ -33,7 +34,7 @@ Reasoning effort: `off` / `low` / `high` (default) / `max`.
 dsh plugin --profile web add github:kyomufs/dsh-opencode-zen
 ```
 
-Restart `dsh web` → **Settings → Models** → pick provider `opencode` → choose a free model (start with `deepseek-v4-flash-free`).
+Restart `dsh web` → **Settings → Models** → pick provider `opencode` → choose a free model (start with `ling-3.0-flash-fin-free`).
 
 ## Configuration (optional — zero config by default)
 
@@ -74,7 +75,7 @@ If this plugin doesn't meet your needs, check out these alternatives:
 A: The free tier has per-IP rate limits. Wait 30–60 seconds, or install [dsh-api-key-pool](https://github.com/xiaozhe7772222/dsh-api-key-pool) to rotate across multiple keys automatically.
 
 **Q: Model returns 403 FreeTierError?**
-A: Make sure you're using version 0.3.0+ of this plugin. Older versions don't include the CLI disguise headers required since 2026-09-16.
+A: Make sure you're using version 0.4.0+ of this plugin. Older versions don't include the CLI disguise headers required since 2026-09-16.
 
 **Q: `opencode` provider doesn't appear in model selector?**
 A: Restart `dsh web` fully (not just refresh). Verify installation with `dsh plugin --profile web list`.
