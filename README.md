@@ -1,31 +1,32 @@
 # dsh-opencode-zen
 
-**Eight free LLMs for DeepSeek Harness, zero config, zero cost.** Brings the OpenCode Zen free tier into your DSH model picker — no signup, no API key, no billing.
+**Nine free LLMs for DeepSeek Harness, zero config, zero cost.** Brings the OpenCode Zen free tier into your DSH model picker — no signup, no API key, no billing.
 
 ---
 
 ## Why?
 
 - **Actually free** — the official free tier authenticates with the literal key `public`; no account, no signup, no API key.
-- **Eight free models** — LongCat 2.5 Preview, ZenSpace Bunny, two Xiaomi MiMo versions, Muse Spark 1.3, Ling 3.0 Flash Fin, and two NVIDIA Nemotrons.
+- **Nine free models** — Big Pickle, Jev 1.13, two Xiaomi MiMo versions, Muse Spark 1.3, Ling 3.0 Flash Fin, Space Bunny, and two NVIDIA Nemotrons.
 - **Install & go** — restart `dsh web` and the `opencode` route appears in the model selector; no configuration needed.
 - **CLI disguise** — requests carry the same headers as the official OpenCode CLI (x-opencode-client, session IDs, gate tools), bypassing the FreeTierError introduced on 2026-09-16.
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
 
-## Models (8 free models)
+## Models (9 free models)
 
 | Model | Context window | Notes |
 |---|---|---|
-| `longcat-2.5-preview-free` | 200k | LongCat 2.5 Preview |
-| `zenspace-bunny-free` | 200k | ZenSpace Bunny |
+| `big-pickle` | 200k | Big Pickle |
+| `jev-1.13-free` | 200k | Jev 1.13 |
+| `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
 | `mimo-v2.5-free` | 200k | Xiaomi MiMo 2.5 |
 | `mimo-v2.6-flash-free` | 200k | Xiaomi MiMo 2.6 Flash |
 | `muse-spark-1.3-contributor-free` | 200k | Muse Spark 1.3 Contributor |
-| `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
 | `nemotron-3.5-lightning-free` | 131,072 | NVIDIA Nemotron 3.5 Lightning |
 | `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
+| `space-bunny-free` | 200k | Space Bunny |
 
 Reasoning effort: `off` / `low` / `high` (default) / `max`.
 
