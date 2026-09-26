@@ -7,7 +7,7 @@
 ## Why?
 
 - **Actually free** — the official free tier authenticates with the literal key `public`; no account, no signup, no API key.
-- **Seven free models** — Ling 3.0 Flash, two Xiaomi MiMo versions, two Muse Spark contributors, and two NVIDIA Nemotrons.
+- **Seven free models** — LongCat 2.5 Preview, ZenSpace Bunny, Xiaomi MiMo 2.6 Flash, Muse Spark 1.3, Ling 3.0 Flash Fin, and two NVIDIA Nemotrons.
 - **Install & go** — restart `dsh web` and the `opencode` route appears in the model selector; no configuration needed.
 - **CLI disguise** — requests carry the same headers as the official OpenCode CLI (x-opencode-client, session IDs, gate tools), bypassing the FreeTierError introduced on 2026-09-16.
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
@@ -18,13 +18,13 @@
 
 | Model | Context window | Notes |
 |---|---|---|
-| `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
-| `mimo-v2.5-free` | 200k | Xiaomi MiMo 2.5 |
+| `longcat-2.5-preview-free` | 200k | LongCat 2.5 Preview |
+| `zenspace-bunny-free` | 200k | ZenSpace Bunny |
 | `mimo-v2.6-flash-free` | 200k | Xiaomi MiMo 2.6 Flash |
-| `muse-spark-1.2-contributor-free` | 200k | Muse Spark 1.2 Contributor |
 | `muse-spark-1.3-contributor-free` | 200k | Muse Spark 1.3 Contributor |
-| `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
+| `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
 | `nemotron-3.5-lightning-free` | 131,072 | NVIDIA Nemotron 3.5 Lightning |
+| `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
 
 Reasoning effort: `off` / `low` / `high` (default) / `max`.
 
@@ -75,7 +75,7 @@ If this plugin doesn't meet your needs, check out these alternatives:
 A: The free tier has per-IP rate limits. Wait 30–60 seconds, or install [dsh-api-key-pool](https://github.com/xiaozhe7772222/dsh-api-key-pool) to rotate across multiple keys automatically.
 
 **Q: Model returns 403 FreeTierError?**
-A: Make sure you're using version 0.4.0+ of this plugin. Older versions don't include the CLI disguise headers required since 2026-09-16.
+A: Make sure you're using version 0.5.0+ of this plugin. Older versions don't include the CLI disguise headers required since 2026-09-16.
 
 **Q: `opencode` provider doesn't appear in model selector?**
 A: Restart `dsh web` fully (not just refresh). Verify installation with `dsh plugin --profile web list`.
