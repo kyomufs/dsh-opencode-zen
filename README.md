@@ -1,20 +1,20 @@
 # dsh-opencode-zen
 
-**Eight free LLMs for DeepSeek Harness, zero config, zero cost.** Brings the OpenCode Zen free tier into your DSH model picker — no signup, no API key, no billing.
+**Nine free LLMs for DeepSeek Harness, zero config, zero cost.** Brings the OpenCode Zen free tier into your DSH model picker — no signup, no API key, no billing.
 
 ---
 
 ## Why?
 
 - **Actually free** — the official free tier authenticates with the literal key `public`; no account, no signup, no API key.
-- **Eight free models** — Big Pickle, Jev 1.13, two Xiaomi MiMo versions, Muse Spark 1.3, Ling 3.0 Flash Fin, and two NVIDIA Nemotrons.
+- **Nine free models** — Big Pickle, Jev 1.13, two Xiaomi MiMo versions, Muse Spark 1.3, Ling 3.0 Flash Fin, Space Bunny, and two NVIDIA Nemotrons.
 - **Install & go** — restart `dsh web` and the `opencode` route appears in the model selector; no configuration needed.
 - **CLI disguise** — requests carry the same headers as the official OpenCode CLI (x-opencode-client, session IDs, gate tools), bypassing the FreeTierError introduced on 2026-09-16.
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
 
-## Models (8 free models)
+## Models (9 free models)
 
 | Model | Context window | Notes |
 |---|---|---|
@@ -26,8 +26,16 @@
 | `muse-spark-1.3-contributor-free` | 200k | Muse Spark 1.3 Contributor |
 | `nemotron-3.5-lightning-free` | 131,072 | NVIDIA Nemotron 3.5 Lightning |
 | `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
+| `space-bunny-free` | 200k | Space Bunny · OpenRouter-backed, **reasoning always on** |
 
 Reasoning effort: `off` / `low` / `high` (default) / `max`.
+
+> **Note on `space-bunny-free`** — this model is not listed in Zen's public model table, but it
+> answers requests. It rejects any call without `reasoning_effort`:
+> `400 {"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}`.
+> The plugin therefore always sends an effort for it (falling back to `high`) and hides the
+> `off` option in the model picker. If you hit that error on any other model, the plugin
+> version is too old — upgrade to 0.8.0+.
 
 ## Installation
 
@@ -69,12 +77,14 @@ If this plugin doesn't meet your needs, check out these alternatives:
 | **opencode2dsh** | Full-featured DSH plugin with IP pool, rotation, and watchdog | [GitHub](https://github.com/FishBottle7/opencode2dsh) |
 | **opencode2api** | HTTP proxy that forwards requests to OpenCode (Go binary) | [GitHub](https://github.com/6Kmfi6HP/opencode2api) |
 | **dsh-opencode-zen (original)** | Original plugin by xiaozhe7772222 (may be outdated) | [GitHub](https://github.com/xiaozhe7772222/dsh-opencode-zen) |
-| **zen-free-models** | Daily scraper of Zen's free model list (syncs OpenCode config) | [GitHub](https://github.com/VcDoc/zen-free-models) |
 
 ## Troubleshooting
 
-**Q: `401 "Model X is not supported"`?**
+**Q: `401 \"Model X is not supported\"`?**
 A: Zen's free lineup rotates. Model IDs come from `https://opencode.ai/zen/v1/models` — see [zen-free-models](https://github.com/VcDoc/zen-free-models) for the current list.
+
+**Q: `400 \"Reasoning is mandatory for this endpoint and cannot be disabled.\"`?**
+A: Upgrade to 0.8.0+. Older versions drop `reasoning_effort` when the effort is set to `off`, which some endpoints (e.g. `space-bunny-free`) reject.
 
 **Q: Model returns 429 Too Many Requests?**
 A: The free tier has per-IP rate limits. Wait 30–60 seconds, or install [dsh-api-key-pool](https://github.com/xiaozhe7772222/dsh-api-key-pool) to rotate across multiple keys automatically.
@@ -96,7 +106,6 @@ A: They use OpenCode Zen's official public free tier. Service availability and q
 - Original plugin: [xiaozhe7772222/dsh-opencode-zen](https://github.com/xiaozhe7772222/dsh-opencode-zen)
 - CLI disguise approach: [FishBottle7/opencode2dsh](https://github.com/FishBottle7/opencode2dsh)
 - Session header injection: [dsh-opencode-session](https://github.com/xiaozhe7772222/dsh-opencode-session)
-- Free model list verification: [VcDoc/zen-free-models](https://github.com/VcDoc/zen-free-models)
 
 ## License
 
