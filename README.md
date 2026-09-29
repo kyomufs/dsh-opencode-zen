@@ -13,22 +13,29 @@
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
+- **Vision** — pasted images, `read_image`, and image blocks ride real requests on the four models verified to accept image input; every other model stays honest text-only, so DSH degrades images to placeholders instead of hitting provider errors.
 
 ## Models (9 free models)
 
 | Model | Context window | Notes |
 |---|---|---|
-| `big-pickle` | 200k | Big Pickle |
+| `big-pickle` | 200k | Big Pickle · **vision** |
 | `jev-1.13-free` | 200k | Jev 1.13 |
 | `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
-| `mimo-v2.5-free` | 200k | Xiaomi MiMo 2.5 |
-| `mimo-v2.6-flash-free` | 200k | Xiaomi MiMo 2.6 Flash |
+| `mimo-v2.5-free` | 200k | Xiaomi MiMo 2.5 · **vision** |
+| `mimo-v2.6-flash-free` | 200k | Xiaomi MiMo 2.6 Flash · **vision** |
 | `muse-spark-1.3-contributor-free` | 200k | Muse Spark 1.3 Contributor |
 | `nemotron-3.5-lightning-free` | 131,072 | NVIDIA Nemotron 3.5 Lightning |
 | `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
-| `space-bunny-free` | 200k | Space Bunny · OpenRouter-backed, **reasoning always on** |
+| `space-bunny-free` | 200k | Space Bunny · OpenRouter-backed, **reasoning always on** · **vision** |
 
 Reasoning effort: `off` / `low` / `high` (default) / `max`.
+
+> **Note on vision** — `vision: true` in `MODELS` is set only from a passing probe against
+> the live Zen wire (a 64×64 red PNG asked "what color?" answered "Red"). Both Nemotrons
+> accept text but reject image requests with `400 Upstream request failed: Endpoint is
+> unavailable.`; `jev`/`ling`/`muse` were unreachable for text *and* image while probing, so
+> they stay text-only until a probe passes. Re-run a probe before flipping a flag.
 
 > **Note on `space-bunny-free`** — this model is not listed in Zen's public model table, but it
 > answers requests. It rejects any call without `reasoning_effort`:
