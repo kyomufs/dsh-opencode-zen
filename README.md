@@ -12,24 +12,29 @@
 - **CLI disguise** — requests carry the same headers as the official OpenCode CLI (x-opencode-client, session IDs, gate tools), bypassing the FreeTierError introduced on 2026-09-16.
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
+- **Hang-proof (0.11.0)** — first-event (30s) and body-idle (120s, 300s on Responses models) watchdogs abort dead tunnels instead of stalling the turn forever; abandoned readers cancel their sockets instead of leaking them.
+- **Recovers like a first-class provider (0.11.0)** — every failure carries DSH-native codes (`SERVER`, `RATE_LIMIT`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE`), so the host retry policy actually fires; a stream that already delivered content is never replayed (no duplicated output).
+- **Honest budgets (0.11.0)** — context windows and output caps come from models.dev metadata per model (MiMo caps at 32k output, Muse at 131k), so a request never over-asks the upstream.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
 - **Vision** — pasted images, `read_image`, and image blocks ride real requests on the four models verified to accept image input; every other model stays honest text-only, so DSH degrades images to placeholders instead of hitting provider errors.
 
 ## Models (9 free models)
 
-| Model | Context window | Notes |
+| Model | Context / output | Notes |
 |---|---|---|
-| `big-pickle` | 200k | Big Pickle · **vision** |
-| `jev-1.13-free` | 200k | Jev 1.13 |
-| `ling-3.0-flash-fin-free` | 200k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
-| `mimo-v2.5-free` | 200k | Xiaomi MiMo 2.5 · **vision** |
-| `mimo-v2.6-flash-free` | 200k | Xiaomi MiMo 2.6 Flash · **vision** |
-| `muse-spark-1.3-contributor-free` | 200k | Muse Spark 1.3 Contributor |
-| `nemotron-3.5-lightning-free` | 131,072 | NVIDIA Nemotron 3.5 Lightning |
-| `nemotron-3-ultra-free` | 131,072 | NVIDIA Nemotron 3 Ultra |
-| `space-bunny-free` | 200k | Space Bunny · OpenRouter-backed, **reasoning always on** · **vision** |
+| `big-pickle` | 200k / 32k | Big Pickle · **vision** |
+| `jev-1.13-free` | 200k / 32k | Jev 1.13 · limits unpublished, conservative budget |
+| `ling-3.0-flash-fin-free` | 262k / 32k | Ling 3.0 Flash Fin · reasoning + tool calls, daily driver |
+| `mimo-v2.5-free` | 200k / 32k | Xiaomi MiMo 2.5 · **vision** |
+| `mimo-v2.6-flash-free` | 200k / 32k | Xiaomi MiMo 2.6 Flash · **vision** |
+| `muse-spark-1.3-contributor-free` | 1M / 131k | Muse Spark 1.3 Contributor · **routed via `/responses`** (its `/chat/completions` answers with a bare 500) |
+| `nemotron-3.5-lightning-free` | 262k / 262k | NVIDIA Nemotron 3.5 Lightning |
+| `nemotron-3-ultra-free` | 1M / 128k | NVIDIA Nemotron 3 Ultra |
+| `space-bunny-free` | 1M / 524k | Space Bunny · OpenRouter-backed, **reasoning always on** · **vision** |
 
-Reasoning effort: `off` / `low` / `high` (default) / `max`.
+Context/output budgets follow models.dev metadata (verified against `GET /zen/v1/models` on 2026-10-02); `max_tokens` is clamped per model.
+
+Reasoning effort: `off` / `low` / `high` (default) / `max`, reduced to the ladder the model actually declares — Muse offers `minimal`…`xhigh` and hides `off`/`max`, Space Bunny hides `off`. `off` sends wire value `none` (omitting the field keeps the provider's thinking on).
 
 > **Note on vision** — `vision: true` in `MODELS` is set only from a passing probe against
 > the live Zen wire (a 64×64 red PNG asked "what color?" answered "Red"). Both Nemotrons
@@ -66,6 +71,15 @@ Set `OPENCODE_ZEN_API_KEY` or `OPENCODE_GO_API_KEY` before starting `dsh web`.
 
 Nothing configured? It falls back to the official public tier (`public`).
 
+Tuning (defaults are live-tuned, only change them if you know why):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSH_ZEN_FIRST_EVENT_MS` | `30000` | connect/headers/first-SSE-event watchdog |
+| `DSH_ZEN_IDLE_MS` | `120000` | body-idle watchdog for chat models |
+| `DSH_ZEN_RESPONSES_IDLE_MS` | `300000` | body-idle watchdog for Responses models (Muse paces slowly) |
+| `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | wire override, used by the test stand |
+
 ## How it works
 
 Since 2026-09-16, OpenCode Zen added server-side validation requiring:
@@ -97,7 +111,16 @@ A: Upgrade to 0.8.0+. Older versions drop `reasoning_effort` when the effort is 
 A: The free tier has per-IP rate limits. Wait 30–60 seconds, or install [dsh-api-key-pool](https://github.com/xiaozhe7772222/dsh-api-key-pool) to rotate across multiple keys automatically.
 
 **Q: Model returns 403 FreeTierError?**
-A: Make sure you're using version 0.5.0+ of this plugin. Older versions don't include the CLI disguise headers required since 2026-09-16.
+A: Make sure you're using version 0.5.0+ of this plugin. Older versions don't include the CLI disguise headers required since 2026-09-16. On current versions a `FreeTierError` after a while of normal usage is the anonymous per-IP quota cooling down — wait a minute or rotate keys with [dsh-api-key-pool](https://github.com/xiaozhe7772222/dsh-api-key-pool).
+
+**Q: `403 {"model":"..."}` (a body that just echoes the model id)?**
+A: The anonymous lane refusing this model for your IP right now — per-IP quota, region gate, or model gate. It is deliberately not retried (hammering makes the window longer): wait for the window, switch model, or stack keys via dsh-api-key-pool.
+
+**Q: `HTTP 500 {"type":"error",...,"message":"Internal server error"}`?**
+A: Until 0.11.0 this was usually `muse-spark-*` hitting `/chat/completions`, which that model simply does not serve (bare 500). 0.11.0 routes Responses-only models through `/responses` automatically. If a *different* model 500s, it is upstream flakiness — the plugin retries once in-process and DSH retries `SERVER` failures up to 3 times with backoff.
+
+**Q: The turn hangs / `terminated UNKNOWN`?**
+A: Both are pre-0.11.0 bugs: no body watchdog (a tunnel could stand silently forever) and failures without DSH-native codes (so the host showed `UNKNOWN` and never retried). Update to 0.11.0+: dead streams die within 30s/120s as `TIMEOUT`, socket deaths surface as `TRANSPORT` and the host retries them.
 
 **Q: `opencode` provider doesn't appear in model selector?**
 A: Restart `dsh web` fully (not just refresh). Verify installation with `dsh plugin --profile web list`.
