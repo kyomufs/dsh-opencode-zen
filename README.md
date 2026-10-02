@@ -16,6 +16,7 @@
 - **Recovers like a first-class provider (0.11.0)** — every failure carries DSH-native codes (`SERVER`, `RATE_LIMIT`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE`), so the host retry policy actually fires; a stream that already delivered content is never replayed (no duplicated output).
 - **Session-safe retries (0.11.1)** — the registered retry policy is the host's resolved flat shape, so `llm/retry` events serialize cleanly (no turn-killing `carries non-JSON-serializable data`), and a 401 rotates to the next pooled key in-process before giving up.
 - **Live-verified effort ladders (0.11.2)** — every reasoning ladder only offers levels the endpoint actually answers: the MiMo endpoints reply a bare 500 to `minimal`/`xhigh`/`max` (live-probed 2026-10-02), so MiMo offers Off/Low/Medium/High and a stale saved `max` clamps to `High` instead of erroring; a 403 that reports the provider's own outage (`Endpoint is unavailable`) is retried as `SERVER` instead of dying as a terminal gate.
+- **Salvages truncated streams (0.11.3)** — a gateway that closes cleanly mid-reply after partial text commits the partial answer as a normal `stop` (the same default dsh-llm applies to a stream that ended without a finish) instead of failing the turn over one dropped tail chunk; a tool call left open still fails honestly (`STREAM_TRUNCATED`) rather than dispatching half-written arguments.
 - **Honest budgets (0.11.0)** — context windows and output caps come from models.dev metadata per model (MiMo caps at 32k output, Muse at 131k), so a request never over-asks the upstream.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
 - **Vision** — pasted images, `read_image`, and image blocks ride real requests on the four models verified to accept image input; every other model stays honest text-only, so DSH degrades images to placeholders instead of hitting provider errors.
@@ -36,7 +37,7 @@
 
 Context/output budgets follow models.dev metadata (verified against `GET /zen/v1/models` on 2026-10-02); `max_tokens` is clamped per model.
 
-Reasoning effort: `off` / `low` / `high` (default) / `max`, reduced to the ladder the model actually declares — Muse offers `minimal`…`xhigh` and hides `off`/`max`, Space Bunny hides `off`. `off` sends wire value `none` (omitting the field keeps the provider's thinking on).
+Reasoning effort: `off` / `low` / `high` (default) / `max`, reduced to the ladder the model actually declares — Muse offers `minimal`…`xhigh` and hides `off`/`max`, Space Bunny hides `off`, MiMo serves only `off`/`low`/`medium`/`high` (higher levels 500). A saved effort outside the ladder clamps to the nearest declared level (`max` → `high` on MiMo), so stale configs keep working. `off` sends wire value `none` (omitting the field keeps the provider's thinking on).
 
 > **Note on vision** — `vision: true` in `MODELS` is set only from a passing probe against
 > the live Zen wire (a 64×64 red PNG asked "what color?" answered "Red"). Both Nemotrons
@@ -122,6 +123,9 @@ A: The anonymous lane refusing this model for your IP right now — per-IP quota
 
 **Q: `HTTP 500 {"type":"error",...,"message":"Internal server error"}`?**
 A: Three known causes, all handled: (1) until 0.11.0 it was usually `muse-spark-*` on `/chat/completions` — 0.11.0 routes Responses-only models through `/responses` automatically; (2) the MiMo endpoints answer a bare 500 to `reasoning_effort` levels they don't serve (`minimal`/`xhigh`/`max`) — 0.11.2 only offers levels the id answers and clamps stale saved efforts, so a 500 that appears at one specific effort is gone after updating; (3) otherwise it is upstream flakiness — the plugin retries once in-process and DSH retries `SERVER` failures up to 3 times with backoff (the `Retry delay: Nms` line is that host retry firing).
+
+**Q: `stream ended without a terminal event after partial output`?**
+A: Pre-0.11.3 the plugin failed the whole turn when the gateway closed a response cleanly before `finish`/`[DONE]`. 0.11.3+ salvages it: a partial **text/reasoning** reply commits as a normal `stop` (dsh-llm does the same for streams ended without a finish) and the turn continues; if a **tool call** was still open it still fails as `STREAM_TRUNCATED`, because half-written tool arguments must never dispatch. Output already delivered is never replayed.
 
 **Q: The turn hangs / `terminated UNKNOWN`?**
 A: Both are pre-0.11.0 bugs: no body watchdog (a tunnel could stand silently forever) and failures without DSH-native codes (so the host showed `UNKNOWN` and never retried). Update to 0.11.0+: dead streams die within 30s/120s as `TIMEOUT`, socket deaths surface as `TRANSPORT` and the host retries them.

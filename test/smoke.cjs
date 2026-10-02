@@ -456,6 +456,20 @@ const server = http.createServer((req, res) => {
       setTimeout(() => res.socket.destroy(), 20)
       return
     }
+    if (scenario.name === 'truncate-text') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      sse(res, isResponses
+        ? { type: 'response.output_text.delta', output_index: 0, delta: 'partial' }
+        : { choices: [{ delta: { content: 'partial' } }] })
+      res.end() // clean EOF, no finish chunk, no [DONE]
+      return
+    }
+    if (scenario.name === 'truncate-tool') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      sse(res, { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read_file', arguments: '{"pa' } }] } }] })
+      res.end() // clean EOF mid tool call, args provably incomplete
+      return
+    }
     if (scenario.name === 'empty') {
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       if (!isResponses) sse(res, { choices: [{ delta: {}, finish_reason: 'stop' }] })
@@ -572,6 +586,28 @@ async function run() {
   await checkAsync('socket death after content is never replayed', async () => {
     await assert.rejects(() => collect(localAdapter.stream(baseOptions())), (error) => error.code === 'TRANSPORT')
     assert.strictEqual(scenario.hits, 1, 'partial output must not be duplicated')
+  })
+
+  scenario.name = 'truncate-text'
+  scenario.hits = 0
+  await checkAsync('clean EOF after partial text commits a stop instead of failing the turn', async () => {
+    const chunks = await collect(localAdapter.stream(baseOptions()))
+    const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+    assert.strictEqual(text, 'partial')
+    const finish = chunks[chunks.length - 1]
+    assert.strictEqual(finish.type, 'finish')
+    assert.strictEqual(finish.reason.kind, 'stop')
+    assert.strictEqual(scenario.hits, 1, 'salvaged output must never be replayed')
+  })
+
+  scenario.name = 'truncate-tool'
+  scenario.hits = 0
+  await checkAsync('clean EOF mid tool call fails honestly instead of dispatching partial args', async () => {
+    await assert.rejects(
+      () => collect(localAdapter.stream(baseOptions())),
+      (error) => error.code === 'STREAM_TRUNCATED' && error.message.includes('without a terminal event'),
+    )
+    assert.strictEqual(scenario.hits, 1, 'a stream with delivered content is never replayed')
   })
 
   scenario.name = 'empty'
