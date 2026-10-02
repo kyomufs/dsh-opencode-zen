@@ -22,7 +22,7 @@ const plugin = require('../lib/index.js')
 const {
   OpenCodeZenAdapter, MODELS, resolveReasoningEffort, resolveMaxTokens,
   ensureFreeLaneShape, buildResponsesBody, translateStream, translateResponsesStream,
-  httpFailure, ensureTyped, isResponsesModel, serializeMessages,
+  httpFailure, ensureTyped, isResponsesModel, serializeMessages, retryDelay,
 } = plugin
 
 let passed = 0
@@ -150,6 +150,44 @@ check('HTTP 429 maps to RATE_LIMIT with Retry-After', () => {
   const failure = httpFailure(429, 'slow down', 15000)
   assert.strictEqual(failure.code, 'RATE_LIMIT')
   assert.strictEqual(failure.failure.providerRetryAfterMs, 15000)
+  // The Retry-After must actually reach the delay: read from failure.failure
+  // (the payload envelope), not the top level — the old top-level read made
+  // asked always 0 and silently capped every delay to ~800ms + jitter.
+  assert.strictEqual(retryDelay(0, failure), 15000)
+})
+check('daily-quota 429 (FreeUsageLimitError, long retry-after) is not hammered', () => {
+  const body = JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Daily usage limit exceeded' } })
+  const failure = httpFailure(429, body, 7200000)
+  assert.strictEqual(failure.code, 'RATE_LIMIT', 'still a rate limit for the host policy')
+  assert.ok(failure.failure.message.includes('FreeUsageLimitError'), failure.failure.message)
+  assert.ok(failure.failure.message.includes('midnight UTC'), failure.failure.message)
+  assert.strictEqual(retryDelay(0, failure), null, 'retry-after beyond the cap must skip the in-process sleep')
+  // Short windows (hourly key limits, the tail before midnight) still retry.
+  const short = httpFailure(429, body, 45000)
+  assert.notStrictEqual(retryDelay(0, short), null)
+})
+check('401 ModelError is terminal and never rotates pool keys', () => {
+  const body = JSON.stringify({ type: 'error', error: { type: 'ModelError', message: 'Model jev-1.13-free is not supported' } })
+  const failure = httpFailure(401, body)
+  assert.strictEqual(failure.code, 'PROVIDER_ERROR')
+  assert.ok(failure.failure.message.includes('does not serve this model'), failure.failure.message)
+  // Real auth rejections keep INVALID_CREDENTIAL so the pool can rotate.
+  const auth = httpFailure(401, JSON.stringify({ type: 'error', error: { type: 'AuthError', message: 'Missing API key' } }))
+  assert.strictEqual(auth.code, 'INVALID_CREDENTIAL')
+  const bare = httpFailure(401, '{"error":{"message":"invalid api key"}}')
+  assert.strictEqual(bare.code, 'INVALID_CREDENTIAL')
+})
+check('403 RegionError / DataPolicyError names the region gate', () => {
+  const failure = httpFailure(403, JSON.stringify({ type: 'error', error: { type: 'RegionError', message: 'Not available in your region' } }))
+  assert.strictEqual(failure.code, 'PROVIDER_ERROR')
+  assert.ok(failure.failure.message.includes('region/policy gate'), failure.failure.message)
+  const policy = httpFailure(403, JSON.stringify({ type: 'error', error: { type: 'DataPolicyError', message: 'blocked by data policy' } }))
+  assert.ok(policy.failure.message.includes('region/policy gate'), policy.failure.message)
+  // Observed FreeTierError wordings from the live gate 2026-10-02.
+  const country = httpFailure(403, '{"error":{"type":"FreeTierError","message":"Error from provider (Console): This model is not available in your country"}}')
+  assert.ok(country.failure.message.includes('region gate'), country.failure.message)
+  const client = httpFailure(403, '{"error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode"}}')
+  assert.ok(client.failure.message.includes('client gate'), client.failure.message)
 })
 check('HTTP 403 carries an actionable hint and stays non-retryable', () => {
   const gate = httpFailure(403, '{"type":"error","error":{"type":"FreeTierError","message":"x"}}')
@@ -429,6 +467,16 @@ const server = http.createServer((req, res) => {
       res.end('{"error":{"message":"invalid api key"}}')
       return
     }
+    if (scenario.name === 'daily429') {
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '7200' })
+      res.end('{"type":"error","error":{"type":"FreeUsageLimitError","message":"Daily usage limit exceeded"}}')
+      return
+    }
+    if (scenario.name === 'err401model') {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end('{"type":"error","error":{"type":"ModelError","message":"Model mimo-v2.6-flash-free is not supported"}}')
+      return
+    }
     if (scenario.name === 'err500') {
       res.writeHead(500, { 'content-type': 'application/json' })
       res.end('{"type":"error","error":{"type":"error","message":"Internal server error"}}')
@@ -534,8 +582,12 @@ async function run() {
   check('request carried canonical session + CLI disguise headers', () => {
     assert.strictEqual(scenario.headers['x-opencode-client'], 'cli')
     assert.match(scenario.headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    // The CLI sends x-opencode-session-id unconditionally (request.ts).
+    assert.strictEqual(scenario.headers['x-opencode-session-id'], scenario.headers['x-opencode-session'])
     assert.strictEqual(scenario.headers['x-session-affinity'], scenario.headers['x-opencode-session'])
-    assert.match(scenario.headers['user-agent'], /^opencode\//)
+    // The opencode lane's UA is the plain `opencode/<version>` (no platform
+    // suffix), matching the real CLI's USER_AGENT byte for byte.
+    assert.match(scenario.headers['user-agent'], /^opencode\/\d+\.\d+\.\d+$/)
     assert.strictEqual(scenario.headers.authorization, 'Bearer public')
   })
   check('request body is budget-clamped and gate-shaped', () => {
@@ -615,6 +667,26 @@ async function run() {
   await checkAsync('empty completion is EMPTY_RESPONSE and retried', async () => {
     await assert.rejects(() => collect(localAdapter.stream(baseOptions())), (error) => error.code === 'EMPTY_RESPONSE')
     assert.strictEqual(scenario.hits, 2)
+  })
+
+  scenario.name = 'daily429'
+  scenario.hits = 0
+  await checkAsync('long-window 429 surfaces at once without a futile in-process replay', async () => {
+    await assert.rejects(
+      () => collect(localAdapter.stream(baseOptions())),
+      (error) => error.code === 'RATE_LIMIT' && error.message.includes('FreeUsageLimitError'),
+    )
+    assert.strictEqual(scenario.hits, 1, 'no point drawing a second 429 for a daily window')
+  })
+
+  scenario.name = 'err401model'
+  scenario.hits = 0
+  await checkAsync('401 ModelError fails fast as PROVIDER_ERROR with no key rotation', async () => {
+    await assert.rejects(
+      () => collect(localAdapter.stream(baseOptions())),
+      (error) => error.code === 'PROVIDER_ERROR' && error.message.includes('does not serve this model'),
+    )
+    assert.strictEqual(scenario.hits, 1, 'a model gate is not credentials: no rotation, no replay')
   })
 
   scenario.name = 'ok'
