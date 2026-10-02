@@ -1,12 +1,15 @@
 {
   "name": "dsh-opencode-zen",
   "description": "OpenCode Zen free models + CLI disguise headers for DeepSeek Harness. Bypasses FreeTierError since 2026-09-16.",
-  "version": "0.11.4",
+  "version": "0.12.0",
   "type": "commonjs",
   "main": "lib/index.js",
   "exports": {
     ".": {
       "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
   },
@@ -21,6 +24,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "peerDependencies": {
@@ -42,6 +48,11 @@
     "llm",
     "provider",
     "disguise",
-    "cli-headers"
+    "cli-headers",
+    "quota",
+    "rate-limit",
+    "ipv4",
+    "ipv6",
+    "diagnostics"
   ]
 }

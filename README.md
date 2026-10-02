@@ -85,6 +85,58 @@ Tuning (defaults are live-tuned, only change them if you know why):
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | wire override, used by the test stand |
 | `OPENCODE_ZEN_POOL_FILE` | `$DSH_HOME/profiles/web/plugins/dsh-api-key-pool/pool-config.json` | key-pool file; re-read automatically when its mtime changes |
 | `DSH_HOME` | `~/.dsh` | harness home used to locate the default key-pool file |
+| `DSH_ZEN_FAMILY` | `auto` | pin the egress address family (`ipv4` / `ipv6` / `auto`); outranks the settings toggle |
+| `DSH_ZEN_STATUS_PORT` | `47821` | loopback port of the status + diagnostics endpoint |
+| `DSH_ZEN_QUOTA_FILE` | `$DSH_HOME/state/dsh-opencode-zen/quota.json` | where daily counters are persisted |
+
+## Daily quota, address families, and the panel
+
+Restart `dsh web` → **Settings → OpenCode Zen**.
+
+The panel shows what the plugin actually observed, because the gateway publishes
+**no rate-limit headers at all** (no `retry-after`, no remaining counter). It is
+built around four facts verified against the live gateway on 2026-10-02:
+
+1. **The bucket key is the raw egress IP string** — opencode's
+   `packages/console/app/src/routes/zen/util/handler.ts:101` does
+   `headers.get("x-real-ip")` with no normalization, and an IPv6 address is
+   truncated to its first four groups.
+2. **IPv4 and IPv6 are separate daily buckets.** With the IPv6 bucket spent, the
+   identical request over IPv4 still answers `200`. Any dual-stack host
+   therefore gets double the intended quota just by switching address family.
+3. **Every address inside one IPv6 /64 shares a bucket**, so privacy addresses
+   rotating through the same prefix do not reset anything.
+4. **All models without their own `rateLimit` share one per-IP bucket** — a
+   request to `mimo-v2.6` burns the quota of `big-pickle` too.
+
+Spoofing headers does **not** work and the panel can prove it in one click:
+`x-real-ip`, `x-forwarded-for`, `true-client-ip` are all overwritten at the edge,
+and a client-supplied `cf-connecting-ip` is rejected by Cloudflare with error
+1000.
+
+What the panel offers:
+
+| Control | Effect |
+|---|---|
+| Response counters per family | successful (2xx) answers this process sent today, per model |
+| Reset countdown | time left until the next UTC midnight, the moment the bucket rolls |
+| `Порог` column | lower bound observed at the first `429` (`≥ N`); `неизвестно` when the bucket was already spent before counting started — never a fabricated limit |
+| Family select | `auto` / `ipv4` / `ipv6`; pins undici's `connect.family`, survives a restart, disabled when `DSH_ZEN_FAMILY` or the plugin config pins it |
+| `Проба ipv4` / `Проба ipv6` | one real minimal request through the chosen family, with the CLI disguise headers and gate tools |
+| `Спуф x-real-ip (A/B)` | identical request with no spoof / `198.51.100.77` / `203.0.113.55`, then the verdict |
+
+Everything the panel does is also available over loopback, which makes the same
+checks scriptable:
+
+```sh
+curl -s http://127.0.0.1:47821/zen/quota | jq
+curl -s -XPOST http://127.0.0.1:47821/zen/family  -H 'content-type: application/json' -d '{"family":"ipv6"}'
+curl -s -XPOST http://127.0.0.1:47821/zen/probe   -H 'content-type: application/json' -d '{"family":"ipv4"}'
+curl -s -XPOST http://127.0.0.1:47821/zen/spoof   -H 'content-type: application/json' -d '{}' | jq .verdict
+```
+
+Counters live in `$DSH_HOME/state/dsh-opencode-zen/quota.json` (three UTC days).
+Set `status: false` in the plugin config to keep the endpoint off entirely.
 
 ## How it works
 

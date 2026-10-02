@@ -733,6 +733,8 @@ async function run() {
   delete process.env.OPENCODE_ZEN_POOL_FILE
   fs.rmSync(poolDir, { recursive: true, force: true })
 
+  await runQuotaTests()
+
   await new Promise((resolve) => server.close(resolve))
 
   console.log(`\n${passed} passed, ${failed} failed`)
@@ -740,6 +742,306 @@ async function run() {
     for (const item of failures) console.log(`  - ${item.label}: ${item.error.stack}`)
     process.exitCode = 1
   }
+}
+
+// --- quota accounting, address-family pinning, probes, status endpoint ---
+async function runQuotaTests() {
+  const os = require('node:os')
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const { createQuotaStore, dayKey, nextReset, normalizeFamily } = require('../lib/quota.js')
+  const { createStatusServer } = require('../lib/status.js')
+  const quotaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zen-quota-'))
+  const quotaFile = path.join(quotaDir, 'quota.json')
+  const day = Date.UTC(2026, 9, 2, 21, 0, 0)
+
+  check('day key follows UTC, because the bucket rolls at 00:00 UTC', () => {
+    assert.strictEqual(dayKey(day), '2026-10-02')
+    assert.strictEqual(dayKey(Date.UTC(2026, 9, 2, 23, 59, 59)), '2026-10-02')
+    assert.strictEqual(dayKey(Date.UTC(2026, 9, 3, 0, 0, 1)), '2026-10-03')
+  })
+
+  check('reset lands on the next UTC midnight', () => {
+    assert.strictEqual(nextReset(Date.UTC(2026, 9, 2, 21, 0, 0)), Date.UTC(2026, 9, 3, 0, 0, 0))
+    assert.strictEqual(nextReset(Date.UTC(2026, 9, 2, 23, 59, 59)), Date.UTC(2026, 9, 3, 0, 0, 0))
+  })
+
+  check('unknown family names collapse to auto', () => {
+    assert.strictEqual(normalizeFamily('ipv4'), 'ipv4')
+    assert.strictEqual(normalizeFamily('IPv6'), 'auto')
+    assert.strictEqual(normalizeFamily(''), 'auto')
+  })
+
+  const store = createQuotaStore({ file: quotaFile, now: () => day })
+
+  check('successful responses are counted per family, never pooled', () => {
+    store.recordSuccess({ family: 'ipv4', model: 'big-pickle' })
+    store.recordSuccess({ family: 'ipv4', model: 'big-pickle' })
+    store.recordSuccess({ family: 'ipv6', model: 'mimo-v2.6-flash-free' })
+    const snapshot = store.snapshot({ family: 'ipv4' })
+    assert.strictEqual(snapshot.buckets.ipv4.ok, 2)
+    assert.strictEqual(snapshot.buckets.ipv6.ok, 1)
+    assert.strictEqual(snapshot.buckets.auto.ok, 0)
+    assert.strictEqual(snapshot.buckets.ipv4.byModel['big-pickle'], 2)
+  })
+
+  check('the first 429 records a lower bound, never a fabricated limit', () => {
+    store.recordDailyLimit({ family: 'ipv4', model: 'mimo-v2.5-free' })
+    store.recordDailyLimit({ family: 'ipv4', model: 'mimo-v2.5-free' })
+    const bucket = store.snapshot({ family: 'ipv4' }).buckets.ipv4
+    assert.strictEqual(bucket.daily429, 2)
+    assert.strictEqual(bucket.first429.ok, 2)
+    assert.strictEqual(bucket.first429.model, 'mimo-v2.5-free')
+  })
+
+  check('counters survive a restart', () => {
+    const reloaded = createQuotaStore({ file: quotaFile, now: () => day })
+    assert.strictEqual(reloaded.snapshot({}).buckets.ipv4.ok, 2)
+    assert.strictEqual(reloaded.snapshot({}).buckets.ipv6.ok, 1)
+  })
+
+  check('the family chosen in the panel survives a restart', () => {
+    assert.strictEqual(store.getFamily(), 'auto')
+    assert.strictEqual(store.setFamily('ipv6'), 'ipv6')
+    assert.strictEqual(createQuotaStore({ file: quotaFile }).getFamily(), 'ipv6')
+  })
+
+  check('yesterday does not leak into today', () => {
+    const rolloverFile = path.join(quotaDir, 'rollover.json')
+    const fresh = createQuotaStore({ file: rolloverFile, now: () => day })
+    fresh.recordSuccess({ family: 'ipv4', model: 'big-pickle' })
+    const tomorrow = createQuotaStore({ file: rolloverFile, now: () => day + 86400000 })
+    assert.strictEqual(tomorrow.snapshot({}).buckets.ipv4.ok, 0)
+  })
+
+  check('quota config defaults to auto family on port 47821', () => {
+    const config = plugin.resolveQuotaConfig({})
+    assert.strictEqual(config.family, 'auto')
+    assert.strictEqual(config.familyLocked, false)
+    assert.strictEqual(config.statusPort, 47821)
+    assert.strictEqual(config.probeModel, 'big-pickle')
+  })
+
+  check('an explicit config family locks the panel toggle', () => {
+    const config = plugin.resolveQuotaConfig({ family: 'ipv4' })
+    assert.strictEqual(config.family, 'ipv4')
+    assert.strictEqual(config.familyLocked, true)
+  })
+
+  check('the env family outranks the stored panel choice', () => {
+    process.env.DSH_ZEN_FAMILY = 'ipv6'
+    try {
+      assert.strictEqual(plugin.resolveQuotaConfig({}).family, 'ipv6')
+      assert.strictEqual(plugin.resolveQuotaConfig({ family: 'ipv4' }).family, 'ipv6')
+    } finally {
+      delete process.env.DSH_ZEN_FAMILY
+    }
+  })
+
+  await checkAsync('auto family never installs a dispatcher', async () => {
+    const pool = plugin.createDispatcherPool({ Agent: class { close() {} } })
+    assert.strictEqual(pool.for('auto'), undefined)
+    await pool.close()
+  })
+
+  await checkAsync('ipv4 and ipv6 get separate pinned dispatchers', async () => {
+    const created = []
+    class Agent {
+      constructor(options) { this.options = options; created.push(options) }
+      async close() {}
+    }
+    const pool = plugin.createDispatcherPool({ Agent })
+    const v4 = pool.for('ipv4')
+    const v6 = pool.for('ipv6')
+    assert.notStrictEqual(v4, undefined)
+    assert.notStrictEqual(v6, undefined)
+    assert.notStrictEqual(v4, v6, 'one Agent per family, never shared')
+    assert.deepStrictEqual(created.map((options) => options.connect.family), [4, 6])
+    assert.strictEqual(pool.for('ipv4'), v4, 'agents are reused, not rebuilt per request')
+    await pool.close()
+  })
+
+  await checkAsync('a missing undici degrades to auto instead of throwing', async () => {
+    const pool = plugin.createDispatcherPool(undefined)
+    if (pool.available) {
+      assert.notStrictEqual(pool.for('ipv4'), undefined, 'undici present: real Agent is built')
+    } else {
+      assert.strictEqual(pool.for('ipv4'), undefined)
+    }
+    await pool.close()
+  })
+
+  await checkAsync('zenProbe sends the CLI disguise headers and the gate tools', async () => {
+    let seen = null
+    const result = await plugin.zenProbe({
+      model: 'big-pickle',
+      family: 'auto',
+      apiKey: 'public',
+      fetchImpl: async (url, init) => {
+        seen = { url, init }
+        return new Response('data: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      },
+    })
+    assert.ok(seen.url.endsWith('/chat/completions'))
+    assert.strictEqual(seen.init.headers.authorization, 'Bearer public')
+    assert.strictEqual(seen.init.headers['user-agent'], 'opencode/1.18.34')
+    assert.strictEqual(seen.init.headers['x-opencode-client'], 'cli')
+    assert.match(seen.init.headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    const body = JSON.parse(seen.init.body)
+    assert.deepStrictEqual(body.tools.map((tool) => tool.function.name), ['bash', 'read'])
+    assert.strictEqual(result.status, 200)
+    assert.strictEqual(result.dailyLimit, false)
+  })
+
+  await checkAsync('zenProbe can carry a spoofed x-real-ip for the A/B', async () => {
+    let seen = null
+    await plugin.zenProbe({
+      model: 'big-pickle',
+      family: 'ipv4',
+      spoofIp: '198.51.100.77',
+      fetchImpl: async (url, init) => {
+        seen = init.headers
+        return new Response('{}', { status: 200 })
+      },
+    })
+    assert.strictEqual(seen['x-real-ip'], '198.51.100.77')
+  })
+
+  await checkAsync('zenProbe classifies the daily quota rejection', async () => {
+    const body = JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded.' } })
+    const result = await plugin.zenProbe({
+      model: 'mimo-v2.6-flash-free',
+      family: 'ipv6',
+      fetchImpl: async () => new Response(body, { status: 429 }),
+    })
+    assert.strictEqual(result.status, 429)
+    assert.strictEqual(result.type, 'FreeUsageLimitError')
+    assert.strictEqual(result.dailyLimit, true)
+  })
+
+  await checkAsync('a spoof that still answers 429 proves the edge wins', async () => {
+    const daily = new Response(
+      JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError' } }),
+      { status: 429 },
+    )
+    const result = await plugin.zenSpoofProbe({
+      model: 'big-pickle',
+      family: 'ipv4',
+      fetchImpl: async () => daily.clone(),
+    })
+    assert.strictEqual(result.probes.length, 3)
+    assert.match(result.verdict, /^NOT VULNERABLE/)
+  })
+
+  await checkAsync('a spoof that answers 200 on a dead bucket would be VULNERABLE', async () => {
+    let call = 0
+    const result = await plugin.zenSpoofProbe({
+      model: 'big-pickle',
+      family: 'ipv4',
+      fetchImpl: async () => {
+        call += 1
+        return call === 1
+          ? new Response(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError' } }), { status: 429 })
+          : new Response('data: [DONE]\n\n', { status: 200 })
+      },
+    })
+    assert.match(result.verdict, /^VULNERABLE/)
+  })
+
+  await checkAsync('status endpoint answers quota, family, probe and 404', async () => {
+    const status = createStatusServer({
+      port: 0,
+      getState: () => ({ family: 'ipv4', buckets: {} }),
+      setFamily: (family) => ({ family, locked: false }),
+      probe: async ({ family: probeFamily }) => ({ family: probeFamily, status: 200 }),
+      spoofProbe: async () => ({ verdict: 'NOT VULNERABLE', probes: [] }),
+    })
+    const { url } = await status.listen()
+    try {
+      const quota = await fetch(`${url}/zen/quota`)
+      assert.strictEqual(quota.status, 200)
+      assert.strictEqual((await quota.json()).family, 'ipv4')
+
+      const switched = await fetch(`${url}/zen/family`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ family: 'ipv6' }),
+      })
+      assert.strictEqual((await switched.json()).family, 'ipv6')
+
+      const probe = await fetch(`${url}/zen/probe`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ family: 'ipv4' }),
+      })
+      assert.strictEqual((await probe.json()).status, 200)
+
+      const spoof = await fetch(`${url}/zen/spoof`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      })
+      assert.match((await spoof.json()).verdict, /NOT VULNERABLE/)
+
+      const missing = await fetch(`${url}/zen/nope`)
+      assert.strictEqual(missing.status, 404)
+    } finally {
+      await status.close()
+    }
+  })
+
+  await checkAsync('the web client registers its settings section through the slot API', async () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
+    const noop = () => {}
+    const fakeReact = {
+      createElement: (type, props, ...children) => ({ type, props, children }),
+      useState: (initial) => [initial, noop],
+      useEffect: noop,
+      useRef: (initial) => ({ current: initial }),
+      useCallback: (fn) => fn,
+    }
+    let exported = null
+    const fakeWindow = {
+      __ModuleLoader__: {
+        load({ id, factory }) {
+          assert.strictEqual(id, 'dsh-opencode-zen')
+          exported = factory(() => fakeReact)
+        },
+      },
+      localStorage: { getItem: () => null, setItem: noop },
+    }
+    const fakeDocument = { readyState: 'complete', addEventListener: noop }
+    // eslint-disable-next-line no-new-func
+    new Function('window', 'document', source)(fakeWindow, fakeDocument)
+
+    assert.ok(exported, 'the loader factory must return the plugin exports')
+    assert.strictEqual(typeof exported.apply, 'function')
+
+    const registrations = []
+    const ctx = {
+      slots: {
+        inject(name, register) {
+          assert.strictEqual(name, 'settings.section')
+          register()
+        },
+        register(descriptor, component) {
+          registrations.push({ descriptor, component })
+          return descriptor
+        },
+      },
+    }
+    exported.apply(ctx)
+    assert.strictEqual(registrations.length, 1)
+    assert.strictEqual(registrations[0].descriptor.id, 'dsh-opencode-zen')
+    assert.strictEqual(registrations[0].descriptor.name, 'settings.section')
+    assert.strictEqual(typeof registrations[0].component, 'function')
+
+    // Rendering the panel with a stub React exercises the component body.
+    const element = registrations[0].component()
+    assert.strictEqual(element.props.className, 'zen-panel')
+  })
+
+  fs.rmSync(quotaDir, { recursive: true, force: true })
 }
 
 run().catch((error) => {
