@@ -14,6 +14,7 @@
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
 - **Hang-proof (0.11.0)** — first-event (30s) and body-idle (120s, 300s on Responses models) watchdogs abort dead tunnels instead of stalling the turn forever; abandoned readers cancel their sockets instead of leaking them.
 - **Recovers like a first-class provider (0.11.0)** — every failure carries DSH-native codes (`SERVER`, `RATE_LIMIT`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE`), so the host retry policy actually fires; a stream that already delivered content is never replayed (no duplicated output).
+- **Session-safe retries (0.11.1)** — the registered retry policy is the host's resolved flat shape, so `llm/retry` events serialize cleanly (no turn-killing `carries non-JSON-serializable data`), and a 401 rotates to the next pooled key in-process before giving up.
 - **Honest budgets (0.11.0)** — context windows and output caps come from models.dev metadata per model (MiMo caps at 32k output, Muse at 131k), so a request never over-asks the upstream.
 - **Full parity** — streaming, reasoning-content passthrough, and tool calls, same experience as paid models.
 - **Vision** — pasted images, `read_image`, and image blocks ride real requests on the four models verified to accept image input; every other model stays honest text-only, so DSH degrades images to placeholders instead of hitting provider errors.
@@ -79,6 +80,8 @@ Tuning (defaults are live-tuned, only change them if you know why):
 | `DSH_ZEN_IDLE_MS` | `120000` | body-idle watchdog for chat models |
 | `DSH_ZEN_RESPONSES_IDLE_MS` | `300000` | body-idle watchdog for Responses models (Muse paces slowly) |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | wire override, used by the test stand |
+| `OPENCODE_ZEN_POOL_FILE` | `$DSH_HOME/profiles/web/plugins/dsh-api-key-pool/pool-config.json` | key-pool file; re-read automatically when its mtime changes |
+| `DSH_HOME` | `~/.dsh` | harness home used to locate the default key-pool file |
 
 ## How it works
 

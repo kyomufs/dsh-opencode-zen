@@ -22,7 +22,7 @@ const plugin = require('../lib/index.js')
 const {
   OpenCodeZenAdapter, MODELS, resolveReasoningEffort, resolveMaxTokens,
   ensureFreeLaneShape, buildResponsesBody, translateStream, translateResponsesStream,
-  httpFailure, ensureTyped, isResponsesModel,
+  httpFailure, ensureTyped, isResponsesModel, serializeMessages,
 } = plugin
 
 let passed = 0
@@ -173,17 +173,72 @@ check('already-typed failures pass through untouched', () => {
 })
 
 const DSH_LLM = '/nix/store/qph9ndg6jv1q0gd819j7am0h7nhs8kpy-dsh-0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm/lib/index.js'
-checkAsync('providerRetryPolicy survives dsh-llm resolveRetryPolicy()', async () => {
-  let dshLlm
-  try { dshLlm = require(DSH_LLM) } catch (error) { console.log(`       (skipped, dsh-llm unavailable: ${error.message})`); return }
+const DSH_UTIL_VALUES = '/nix/store/qph9ndg6jv1q0gd819j7am0h7nhs8kpy-dsh-0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-util-values/lib/index.js'
+
+checkAsync('providerRetryPolicy is the resolved flat policy the host retry reads', async () => {
   const policy = adapter.providerRetryPolicy('opencode')
-  const resolved = dshLlm.resolveRetryPolicy(policy, 'test')
-  assert.strictEqual(resolved.mode, 'normal')
-  assert.ok(resolved.retryableCodes.includes('SERVER'))
-  assert.ok(resolved.retryableCodes.includes('RATE_LIMIT'))
-  assert.ok(resolved.retryableCodes.includes('TRANSPORT'))
-  assert.ok(resolved.retryableCodes.includes('EMPTY_RESPONSE'))
-  assert.ok(!resolved.retryableCodes.includes('RATE_LIMITED'), 'the old bogus code must be gone')
+  // dsh-llm registers adapter-owned policies AS-IS (prepareRoutes never runs
+  // resolveRetryPolicy on them). dsh-llm-retry's localDelay reads
+  // initialDelayMs/maxDelayMs/jitterRatio from the TOP level; the previous
+  // nested `backoff` shape made delayMs = NaN, session.append("llm/retry")
+  // rejected the non-finite number and the turn died with
+  // `session event "llm/retry" carries non-JSON-serializable data`.
+  assert.strictEqual(policy.mode, 'normal')
+  assert.strictEqual(policy.initialDelayMs, 800)
+  assert.strictEqual(policy.maxDelayMs, 8000)
+  assert.strictEqual(policy.jitterRatio, 0.2)
+  assert.strictEqual(policy.backoff, undefined, 'backoff must not stay nested')
+  assert.strictEqual(policy.maxRetries, 3)
+  assert.ok(policy.retryableCodes.includes('SERVER'))
+  assert.ok(policy.retryableCodes.includes('RATE_LIMIT'))
+  assert.ok(policy.retryableCodes.includes('TRANSPORT'))
+  assert.ok(policy.retryableCodes.includes('EMPTY_RESPONSE'))
+  assert.ok(!policy.retryableCodes.includes('RATE_LIMITED'), 'the old bogus code must be gone')
+
+  // localDelay as dsh-llm-retry computes it must stay finite for both policy
+  // sources (host resolver and standalone fallback).
+  const localDelay = (p, retry, random) => {
+    const exponential = Math.min(p.initialDelayMs * 2 ** Math.min(retry - 1, 1024), p.maxDelayMs)
+    return Math.min(exponential * (1 - p.jitterRatio + 2 * p.jitterRatio * random()), p.maxDelayMs)
+  }
+  assert.ok(Number.isFinite(localDelay(policy, 1, Math.random)), 'delayMs must be finite')
+  assert.ok(Number.isFinite(localDelay(policy, 3, Math.random)), 'delayMs must be finite at max retry')
+
+  // The full llm/retry event payload must survive the host's lossless-JSON
+  // snapshot — that check is exactly what threw in production.
+  let utilValues
+  try { utilValues = await import(DSH_UTIL_VALUES) } catch (error) {
+    console.log(`       (snapshot check skipped, dsh-util-values unavailable: ${error.message})`)
+    return
+  }
+  const eventData = {
+    retryId: 'r-1',
+    turn: 7,
+    step: 28,
+    provider: 'opencode',
+    mode: policy.mode,
+    policyKey: JSON.stringify([policy.mode, policy.maxRetries, [...policy.retryableCodes].sort(), policy.initialDelayMs, policy.maxDelayMs, policy.jitterRatio]),
+    retry: 1,
+    maxRetries: policy.maxRetries,
+    delayMs: localDelay(policy, 1, () => 0.5),
+    failure: { message: 'OpenCode Zen transport error: fetch failed', code: 'TRANSPORT' },
+  }
+  assert.notStrictEqual(utilValues.snapshotJsonValue(eventData), undefined, 'llm/retry payload must be JSON-snapshotable')
+})
+
+checkAsync('the pre-resolve config shape validates against the host resolver', async () => {
+  let dshLlm
+  try { dshLlm = require(DSH_LLM) } catch (error) {
+    console.log(`       (skipped, dsh-llm unavailable: ${error.message})`)
+    return
+  }
+  const resolved = dshLlm.resolveRetryPolicy({
+    mode: 'normal',
+    maxRetries: 3,
+    retryableCodes: ['RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE'],
+    backoff: { initialDelayMs: 800, maxDelayMs: 8000, jitterRatio: 0.2 },
+  }, 'test')
+  assert.deepStrictEqual({ ...adapter.providerRetryPolicy('opencode') }, { ...resolved })
 })
 
 console.log('\n[4] request shapes')
@@ -254,6 +309,30 @@ checkAsync('chat SSE chunks become harness blocks with a terminal finish', async
   assert.strictEqual(finish.reason.kind, 'stop')
   assert.strictEqual(probe.sawFinish, true)
 })
+checkAsync('finish_reason "length" becomes max-tokens, not stop', async () => {
+  async function* source() {
+    yield { choices: [{ delta: { content: 'cut off' }, finish_reason: 'length' }] }
+  }
+  const probe = { sawDone: false, sawFinish: false }
+  const chunks = await collect(translateStream(source(), () => '{}', probe))
+  const finish = chunks[chunks.length - 1]
+  assert.strictEqual(finish.type, 'finish')
+  assert.strictEqual(finish.reason.kind, 'max-tokens')
+})
+checkAsync('empty assistant/user messages never reach the wire', async () => {
+  const wire = await serializeMessages([
+    { role: 'system', content: 'be terse' },
+    { role: 'user', content: [] },
+    { role: 'assistant', content: [{ type: 'text', text: '' }, { type: 'reasoning', text: '' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'kept' }] },
+    { role: 'user', content: [{ type: 'text', text: '' }] },
+    { role: 'user', content: [{ type: 'text', text: 'next' }] },
+  ], undefined, undefined)
+  assert.deepStrictEqual(wire.map((m) => m.role), ['system', 'assistant', 'user'])
+  assert.deepStrictEqual(wire.map((m) => m.content), ['be terse', 'kept', 'next'])
+  // Empty turns would earn a hard 400 from a gateway that validates content.
+  assert.ok(wire.every((m) => m.content !== '' && m.content.length > 0))
+})
 checkAsync('empty chat completion is EMPTY_RESPONSE', async () => {
   async function* source() { yield { choices: [{ delta: {}, finish_reason: 'stop' }] } }
   const probe = { sawDone: false, sawFinish: false }
@@ -310,7 +389,7 @@ checkAsync('Responses failed event surfaces as SERVER', async () => {
 
 // ------------------------------------------------------------------ e2e wire
 
-const scenario = { name: 'ok', hits: 0, headers: null, body: null }
+const scenario = { name: 'ok', hits: 0, headers: null, body: null, authLog: [] }
 
 function sse(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`)
@@ -322,9 +401,15 @@ const server = http.createServer((req, res) => {
   req.on('data', (chunk) => { raw += chunk })
   req.on('end', () => {
     scenario.headers = req.headers
+    if (Array.isArray(scenario.authLog)) scenario.authLog.push(req.headers.authorization)
     try { scenario.body = JSON.parse(raw) } catch { scenario.body = raw }
 
     const isResponses = req.url.endsWith('/responses')
+    if (scenario.name === 'unauthorized' && scenario.hits === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end('{"error":{"message":"invalid api key"}}')
+      return
+    }
     if (scenario.name === 'err500') {
       res.writeHead(500, { 'content-type': 'application/json' })
       res.end('{"type":"error","error":{"type":"error","message":"Internal server error"}}')
@@ -489,6 +574,37 @@ async function run() {
     assert.ok(!('messages' in scenario.body), 'Responses body must not carry chat messages')
     assert.strictEqual(scenario.body.max_output_tokens, 131072)
   })
+
+  // --- key pool: 401 rotation and live reload -----------------------------
+  const os = require('node:os')
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const poolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zen-pool-'))
+  const poolFile = path.join(poolDir, 'pool.json')
+  fs.writeFileSync(poolFile, JSON.stringify({ pools: { opencode: { keys: ['keyA', 'keyB'] } } }))
+  process.env.OPENCODE_ZEN_POOL_FILE = poolFile
+  delete require.cache[require.resolve('../lib/index.js')]
+  const pooled = require('../lib/index.js')
+  const pooledAdapter = new pooled.OpenCodeZenAdapter({ get: () => undefined, logger: { info() {}, warn() {} } })
+
+  scenario.name = 'unauthorized'
+  scenario.hits = 0
+  scenario.authLog = []
+  await checkAsync('401 rotates to the next pool key in-process', async () => {
+    const chunks = await collect(pooledAdapter.stream(baseOptions()))
+    assert.strictEqual(chunks[chunks.length - 1].type, 'finish')
+    assert.strictEqual(scenario.hits, 2, 'one 401 plus one successful retry')
+    assert.deepStrictEqual(scenario.authLog, ['Bearer keyA', 'Bearer keyB'])
+  })
+
+  await checkAsync('pool config edits are picked up without a restart', async () => {
+    fs.writeFileSync(poolFile, JSON.stringify({ pools: { opencode: { keys: ['keyX'] } } }))
+    const mtime = fs.statSync(poolFile).mtimeMs
+    fs.utimesSync(poolFile, new Date(mtime + 5000), new Date(mtime + 5000))
+    assert.strictEqual(pooled.resolveApiKey(), 'keyX')
+  })
+  delete process.env.OPENCODE_ZEN_POOL_FILE
+  fs.rmSync(poolDir, { recursive: true, force: true })
 
   await new Promise((resolve) => server.close(resolve))
 
