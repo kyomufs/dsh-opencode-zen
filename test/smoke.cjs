@@ -107,6 +107,13 @@ checkAsync('reasoning ladders match the declared effort sets', async () => {
   const mimo = await adapter.resolveModel('opencode', 'mimo-v2.6-flash-free')
   assert.ok(mimo.reasoning.efforts.some((e) => e.id === 'off'))
   assert.strictEqual(mimo.reasoning.defaultEffort, 'high')
+  // mimo endpoints answer HTTP 500 to minimal/xhigh/max (live-probed
+  // 2026-10-02), so neither mimo id may offer them.
+  for (const id of ['mimo-v2.5-free', 'mimo-v2.6-flash-free']) {
+    const model = await adapter.resolveModel('opencode', id)
+    const ids = model.reasoning.efforts.map((e) => e.id)
+    assert.deepStrictEqual(ids, ['off', 'low', 'medium', 'high'], `${id} ladder`)
+  }
 })
 check('max tokens clamp to the model budget', () => {
   const mimo = MODELS.find((m) => m.id === 'mimo-v2.6-flash-free')
@@ -123,6 +130,13 @@ check('reasoning effort wire mapping', () => {
   // Responses models cannot be silenced: off omits the field entirely.
   assert.strictEqual(resolveReasoningEffort('muse-spark-1.3-contributor-free', 'off'), undefined)
   assert.strictEqual(resolveReasoningEffort('muse-spark-1.3-contributor-free', 'minimal'), 'minimal')
+  // Efforts outside the model's declared ladder clamp to the nearest level
+  // instead of reaching the wire (mimo answers 500 to max/xhigh/minimal).
+  assert.strictEqual(resolveReasoningEffort('mimo-v2.6-flash-free', 'max'), 'high')
+  assert.strictEqual(resolveReasoningEffort('mimo-v2.5-free', 'xhigh'), 'high')
+  assert.strictEqual(resolveReasoningEffort('mimo-v2.5-free', 'minimal'), 'low')
+  assert.strictEqual(resolveReasoningEffort('space-bunny-free', 'max'), 'max')
+  assert.strictEqual(resolveReasoningEffort('not-a-real-model', 'max'), 'max')
 })
 
 console.log('\n[3] failure taxonomy + host retry policy')
@@ -142,8 +156,13 @@ check('HTTP 403 carries an actionable hint and stays non-retryable', () => {
   assert.strictEqual(gate.code, 'PROVIDER_ERROR')
   assert.ok(gate.failure.message.includes('canonical ses_ session'))
   const quota = httpFailure(403, '{"model":"mimo-v2.6-flash-free"}')
+  assert.strictEqual(quota.code, 'PROVIDER_ERROR')
   assert.ok(quota.failure.message.includes('anonymous-lane refusal'))
   assert.ok(!('providerRetryAfterMs' in quota.failure))
+  // A 403 reporting the provider's own outage is transient, not a quota gate.
+  const outage = httpFailure(403, '{"error":{"type":"server_error","message":"Error from provider (Console): Upstream request failed: Endpoint is unavailable."}}')
+  assert.strictEqual(outage.code, 'SERVER')
+  assert.ok(outage.failure.message.includes('upstream provider outage'))
 })
 check('undici "terminated" becomes a typed TRANSPORT with the cause chain', () => {
   const raw = new TypeError('terminated')
