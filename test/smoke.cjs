@@ -1016,6 +1016,9 @@ async function runQuotaTests() {
 
     assert.ok(exported, 'the loader factory must return the plugin exports')
     assert.strictEqual(typeof exported.apply, 'function')
+    // Regression guard: the fiber resolves only the services named in `inject`,
+    // and a missing 'slots' entry made the client fail to activate at boot.
+    assert.deepStrictEqual(exported.inject, ['slots'])
 
     const registrations = []
     const ctx = {
@@ -1039,6 +1042,18 @@ async function runQuotaTests() {
     // Rendering the panel with a stub React exercises the component body.
     const element = registrations[0].component()
     assert.strictEqual(element.props.className, 'zen-panel')
+
+    // A broken settings shell must not take the whole web entry down.
+    const warnings = []
+    const previousWarn = console.warn
+    console.warn = (...args) => warnings.push(args.join(' '))
+    try {
+      exported.apply({})
+    } finally {
+      console.warn = previousWarn
+    }
+    assert.strictEqual(warnings.length, 1, 'the failure is reported, not thrown')
+    assert.match(warnings[0], /settings section unavailable/)
   })
 
   fs.rmSync(quotaDir, { recursive: true, force: true })
