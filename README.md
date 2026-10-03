@@ -12,6 +12,7 @@
 - **CLI disguise** — requests carry the same headers as the official OpenCode CLI (x-opencode-client, session IDs, gate tools), bypassing the FreeTierError introduced on 2026-09-16.
 - **Stack quotas** — pairs with dsh-api-key-pool for round-robin rotation across multiple free accounts, automatically.
 - **Quota-aware** — built-in 429/5xx backoff and request throttling so you never blow through the free quota.
+- **Native family menu (0.14.0)** — the `auto / ipv4 / ipv6` switch is a DSH-native menu (shipped `Menu` primitive: same surface, checkmark, keyboard handling) sitting in the composer tool row next to model/effort; the quota numbers moved to Settings → OpenCode Zen and the status line above the composer is gone.
 - **Hang-proof (0.11.0)** — first-event (30s) and body-idle (120s, 300s on Responses models) watchdogs abort dead tunnels instead of stalling the turn forever; abandoned readers cancel their sockets instead of leaking them.
 - **Recovers like a first-class provider (0.11.0)** — every failure carries DSH-native codes (`SERVER`, `RATE_LIMIT`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE`), so the host retry policy actually fires; a stream that already delivered content is never replayed (no duplicated output).
 - **Session-safe retries (0.11.1)** — the registered retry policy is the host's resolved flat shape, so `llm/retry` events serialize cleanly (no turn-killing `carries non-JSON-serializable data`), and a 401 rotates to the next pooled key in-process before giving up.
@@ -85,7 +86,7 @@ Tuning (defaults are live-tuned, only change them if you know why):
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | wire override, used by the test stand |
 | `OPENCODE_ZEN_POOL_FILE` | `$DSH_HOME/profiles/web/plugins/dsh-api-key-pool/pool-config.json` | key-pool file; re-read automatically when its mtime changes |
 | `DSH_HOME` | `~/.dsh` | harness home used to locate the default key-pool file |
-| `DSH_ZEN_FAMILY` | `auto` | pin the egress address family (`ipv4` / `ipv6` / `auto`); outranks the settings toggle |
+| `DSH_ZEN_FAMILY` | `auto` | pin the egress address family (`ipv4` / `ipv6` / `auto`); outranks the composer menu |
 | `DSH_ZEN_STATUS_PORT` | `47821` | loopback port of the status + diagnostics endpoint |
 | `DSH_ZEN_QUOTA_FILE` | `$DSH_HOME/state/dsh-opencode-zen/quota.json` | where daily counters are persisted |
 
@@ -118,8 +119,7 @@ What the panel offers:
 
 | Control | Effect |
 |---|---|
-| Chat, next to the send button (`Zen · ipv4`) | the family every Zen request goes through; one click cycles `auto → ipv4 → ipv6`. The button turns red while the current family is the exhausted one |
-| Chat, one line above the composer | per-family verdict (`свободна` / `исчерпана при ≥ N`), the 2xx count per family, and the countdown to the next UTC midnight |
+| Chat, composer tool row (`Zen · <family>`) | a DSH-native menu next to model/effort — the same surface, checkmark and keyboard handling as the shipped menu; `auto / ipv4 / ipv6`, current family preselected. The trigger turns red while the current family is the exhausted one |
 | **Settings → OpenCode Zen** | the same statistics as a table: 2xx answers today, the observed threshold, the rate-limit status per family |
 
 The counters are per address family because the buckets are. No surface invents

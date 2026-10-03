@@ -990,22 +990,35 @@ async function runQuotaTests() {
     }
   })
 
-  await checkAsync('the web client registers its three conversation and settings seats', async () => {
+  await checkAsync('the web client registers its two composer and settings seats', async () => {
     const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
     const noop = () => {}
     const fakeReact = {
       createElement: (type, props, ...children) => ({ type, props, children }),
-      useState: (initial) => [initial, noop],
+      useState: (initial) => [typeof initial === 'function' ? initial() : initial, noop],
       useEffect: noop,
       useRef: (initial) => ({ current: initial }),
       useCallback: (fn) => fn,
+    }
+    const fakePrimitives = {
+      // The real primitive draws the DSH menu surface; the stub only marks
+      // which component we asked for, plus stable icon markers.
+      Menu: function ZenMenuStub(props) { return props },
+      IconGlobeOutlineRegular: 'icon-globe',
+      IconChevronDownOutlineRegular: 'icon-chevron-down',
+      IconClockOutlineRegular: 'icon-clock',
+    }
+    const fakeRequire = (specifier) => {
+      if (specifier === 'react') return fakeReact
+      if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return fakePrimitives
+      throw new Error(`unexpected require: ${specifier}`)
     }
     let exported = null
     const fakeWindow = {
       __ModuleLoader__: {
         load({ id, factory }) {
           assert.strictEqual(id, 'dsh-opencode-zen')
-          exported = factory(() => fakeReact)
+          exported = factory(fakeRequire)
         },
       },
       localStorage: { getItem: () => null, setItem: noop },
@@ -1033,10 +1046,10 @@ async function runQuotaTests() {
     }
     exported.apply(ctx)
 
-    // The family switch belongs in the composer, the numbers in Settings.
+    // The family menu lives in the composer tool row next to model/effort,
+    // the numbers in Settings. The dock line is gone from the main screen.
     const seats = registrations.map((entry) => entry.seat).sort()
     assert.deepStrictEqual(seats, [
-      'conversation.input.dock',
       'conversation.input.right',
       'settings.section',
     ])
@@ -1047,10 +1060,23 @@ async function runQuotaTests() {
 
     // Rendering each surface with a stub React exercises the component bodies.
     assert.strictEqual(panel.component().props.className, 'zen-panel')
-    const toggle = registrations.find((entry) => entry.seat === 'conversation.input.right')
-    assert.strictEqual(toggle.component().type, 'button', 'the composer seat is a button')
-    const dock = registrations.find((entry) => entry.seat === 'conversation.input.dock')
-    assert.strictEqual(dock.component(), null, 'no snapshot, no status line')
+
+    // The composer seat must be the DSH Menu, not a hand-rolled button: same
+    // surface, checkmark selection and keyboard handling as model/effort.
+    const menu = registrations.find((entry) => entry.seat === 'conversation.input.right')
+    const rendered = menu.component()
+    assert.strictEqual(rendered.type, fakePrimitives.Menu, 'the composer seat renders the DSH Menu primitive')
+    assert.strictEqual(rendered.props.open, false, 'the menu starts closed')
+    assert.deepStrictEqual(rendered.props.items.map((item) => item.id), ['auto', 'ipv4', 'ipv6'])
+    assert.strictEqual(rendered.props.selectedId, 'auto', 'the current family is preselected')
+    assert.strictEqual(rendered.props.portal, true, 'the menu portals over the composer')
+    assert.strictEqual(rendered.props.selection, 'check', 'the selected family shows a checkmark')
+    assert.strictEqual(typeof rendered.props.onSelect, 'function')
+    assert.strictEqual(typeof rendered.props.onClose, 'function')
+    const anchor = rendered.props.anchor
+    assert.strictEqual(anchor.type, 'button', 'the menu opens from a trigger button')
+    assert.strictEqual(anchor.props['aria-haspopup'], 'menu')
+    assert.strictEqual(anchor.props.type, 'button')
 
     // A broken settings shell must not take the whole web entry down.
     const warnings = []
@@ -1061,7 +1087,7 @@ async function runQuotaTests() {
     } finally {
       console.warn = previousWarn
     }
-    assert.strictEqual(warnings.length, 3, 'every seat reports instead of throwing')
+    assert.strictEqual(warnings.length, 2, 'every seat reports instead of throwing')
     for (const warning of warnings) assert.match(warning, /slot .* unavailable/)
   })
 
