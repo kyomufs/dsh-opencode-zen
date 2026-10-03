@@ -118,21 +118,23 @@ What the panel offers:
 
 | Control | Effect |
 |---|---|
-| Response counters per family | successful (2xx) answers this process sent today, per model |
-| Reset countdown | time left until the next UTC midnight, the moment the bucket rolls |
-| `Порог` column | lower bound observed at the first `429` (`≥ N`); `неизвестно` when the bucket was already spent before counting started — never a fabricated limit |
-| Family select | `auto` / `ipv4` / `ipv6`; pins undici's `connect.family`, survives a restart, disabled when `DSH_ZEN_FAMILY` or the plugin config pins it |
-| `Проба ipv4` / `Проба ipv6` | one real minimal request through the chosen family, with the CLI disguise headers and gate tools |
-| `Спуф x-real-ip (A/B)` | identical request with no spoof / `198.51.100.77` / `203.0.113.55`, then the verdict |
+| Chat, next to the send button (`Zen · ipv4`) | the family every Zen request goes through; one click cycles `auto → ipv4 → ipv6`. The button turns red while the current family is the exhausted one |
+| Chat, one line above the composer | per-family verdict (`свободна` / `исчерпана при ≥ N`), the 2xx count per family, and the countdown to the next UTC midnight |
+| **Settings → OpenCode Zen** | the same statistics as a table: 2xx answers today, the observed threshold, the rate-limit status per family |
 
-Everything the panel does is also available over loopback, which makes the same
-checks scriptable:
+The counters are per address family because the buckets are. No surface invents
+a limit: the `Порог` column is the lower bound seen at the first
+`FreeUsageLimitError` (`≥ N`), or `неизвестно` when the bucket was already spent
+before this process started counting.
+
+The diagnostics endpoints stay available for scripting and for reproducing the
+findings — they are simply no longer buttons in the UI:
 
 ```sh
 curl -s http://127.0.0.1:47821/zen/quota | jq
 curl -s -XPOST http://127.0.0.1:47821/zen/family  -H 'content-type: application/json' -d '{"family":"ipv6"}'
 curl -s -XPOST http://127.0.0.1:47821/zen/probe   -H 'content-type: application/json' -d '{"family":"ipv4"}'
-curl -s -XPOST http://127.0.0.1:47821/zen/spoof   -H 'content-type: application/json' -d '{}' | jq .verdict
+curl -s -XPOST http://127.0.0.1:47821/zen/spoof   -H 'content-type: application/json' -d '{}' | jq -r .verdict
 ```
 
 Counters live in `$DSH_HOME/state/dsh-opencode-zen/quota.json` (three UTC days).

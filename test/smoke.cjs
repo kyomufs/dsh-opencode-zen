@@ -990,7 +990,7 @@ async function runQuotaTests() {
     }
   })
 
-  await checkAsync('the web client registers its settings section through the slot API', async () => {
+  await checkAsync('the web client registers its three conversation and settings seats', async () => {
     const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
     const noop = () => {}
     const fakeReact = {
@@ -1021,27 +1021,36 @@ async function runQuotaTests() {
     assert.deepStrictEqual(exported.inject, ['slots'])
 
     const registrations = []
+    let currentSeat = null
     const ctx = {
       slots: {
-        inject(name, register) {
-          assert.strictEqual(name, 'settings.section')
-          register()
-        },
+        inject(seat, register) { currentSeat = seat; register() },
         register(descriptor, component) {
-          registrations.push({ descriptor, component })
+          registrations.push({ seat: currentSeat, descriptor, component })
           return descriptor
         },
       },
     }
     exported.apply(ctx)
-    assert.strictEqual(registrations.length, 1)
-    assert.strictEqual(registrations[0].descriptor.id, 'dsh-opencode-zen')
-    assert.strictEqual(registrations[0].descriptor.name, 'settings.section')
-    assert.strictEqual(typeof registrations[0].component, 'function')
 
-    // Rendering the panel with a stub React exercises the component body.
-    const element = registrations[0].component()
-    assert.strictEqual(element.props.className, 'zen-panel')
+    // The family switch belongs in the composer, the numbers in Settings.
+    const seats = registrations.map((entry) => entry.seat).sort()
+    assert.deepStrictEqual(seats, [
+      'conversation.input.dock',
+      'conversation.input.right',
+      'settings.section',
+    ])
+
+    const panel = registrations.find((entry) => entry.seat === 'settings.section')
+    assert.strictEqual(panel.descriptor.id, 'dsh-opencode-zen')
+    assert.strictEqual(typeof panel.component, 'function')
+
+    // Rendering each surface with a stub React exercises the component bodies.
+    assert.strictEqual(panel.component().props.className, 'zen-panel')
+    const toggle = registrations.find((entry) => entry.seat === 'conversation.input.right')
+    assert.strictEqual(toggle.component().type, 'button', 'the composer seat is a button')
+    const dock = registrations.find((entry) => entry.seat === 'conversation.input.dock')
+    assert.strictEqual(dock.component(), null, 'no snapshot, no status line')
 
     // A broken settings shell must not take the whole web entry down.
     const warnings = []
@@ -1052,8 +1061,8 @@ async function runQuotaTests() {
     } finally {
       console.warn = previousWarn
     }
-    assert.strictEqual(warnings.length, 1, 'the failure is reported, not thrown')
-    assert.match(warnings[0], /settings section unavailable/)
+    assert.strictEqual(warnings.length, 3, 'every seat reports instead of throwing')
+    for (const warning of warnings) assert.match(warning, /slot .* unavailable/)
   })
 
   fs.rmSync(quotaDir, { recursive: true, force: true })
