@@ -1,7 +1,7 @@
 {
   "name": "dsh-opencode-zen",
   "description": "OpenCode Zen free models + CLI disguise headers for DeepSeek Harness. Bypasses FreeTierError since 2026-09-16.",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "type": "commonjs",
   "main": "lib/index.js",
   "exports": {

@@ -990,7 +990,7 @@ async function runQuotaTests() {
     }
   })
 
-  await checkAsync('the web client registers its two composer and settings seats', async () => {
+  await checkAsync('the web client registers its settings seat only', async () => {
     const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
     const noop = () => {}
     const fakeReact = {
@@ -1001,11 +1001,8 @@ async function runQuotaTests() {
       useCallback: (fn) => fn,
     }
     const fakePrimitives = {
-      // The real primitive draws the DSH menu surface; the stub only marks
-      // which component we asked for, plus stable icon markers.
-      Menu: function ZenMenuStub(props) { return props },
+      // Stable icon markers; the client only pulls the two icons it renders.
       IconGlobeOutlineRegular: 'icon-globe',
-      IconChevronDownOutlineRegular: 'icon-chevron-down',
       IconClockOutlineRegular: 'icon-clock',
     }
     const fakeRequire = (specifier) => {
@@ -1021,7 +1018,6 @@ async function runQuotaTests() {
           exported = factory(fakeRequire)
         },
       },
-      localStorage: { getItem: () => null, setItem: noop },
     }
     const fakeDocument = { readyState: 'complete', addEventListener: noop }
     // eslint-disable-next-line no-new-func
@@ -1046,37 +1042,26 @@ async function runQuotaTests() {
     }
     exported.apply(ctx)
 
-    // The family menu lives in the composer tool row next to model/effort,
-    // the numbers in Settings. The dock line is gone from the main screen.
-    const seats = registrations.map((entry) => entry.seat).sort()
-    assert.deepStrictEqual(seats, [
-      'conversation.input.right',
-      'settings.section',
-    ])
+    // Since 0.15.0 the whole surface lives in Settings: the family switch
+    // moved out of the composer and diagnostics stay on the loopback
+    // endpoints, so exactly one seat is registered.
+    const seats = registrations.map((entry) => entry.seat)
+    assert.deepStrictEqual(seats, ['settings.section'])
 
     const panel = registrations.find((entry) => entry.seat === 'settings.section')
     assert.strictEqual(panel.descriptor.id, 'dsh-opencode-zen')
+    assert.strictEqual(typeof panel.descriptor.label, 'function')
+    assert.strictEqual(panel.descriptor.label(), 'OpenCode Zen')
     assert.strictEqual(typeof panel.component, 'function')
 
-    // Rendering each surface with a stub React exercises the component bodies.
+    // Rendering the surface with a stub React exercises the component body.
     assert.strictEqual(panel.component().props.className, 'zen-panel')
 
-    // The composer seat must be the DSH Menu, not a hand-rolled button: same
-    // surface, checkmark selection and keyboard handling as model/effort.
-    const menu = registrations.find((entry) => entry.seat === 'conversation.input.right')
-    const rendered = menu.component()
-    assert.strictEqual(rendered.type, fakePrimitives.Menu, 'the composer seat renders the DSH Menu primitive')
-    assert.strictEqual(rendered.props.open, false, 'the menu starts closed')
-    assert.deepStrictEqual(rendered.props.items.map((item) => item.id), ['auto', 'ipv4', 'ipv6'])
-    assert.strictEqual(rendered.props.selectedId, 'auto', 'the current family is preselected')
-    assert.strictEqual(rendered.props.portal, true, 'the menu portals over the composer')
-    assert.strictEqual(rendered.props.selection, 'check', 'the selected family shows a checkmark')
-    assert.strictEqual(typeof rendered.props.onSelect, 'function')
-    assert.strictEqual(typeof rendered.props.onClose, 'function')
-    const anchor = rendered.props.anchor
-    assert.strictEqual(anchor.type, 'button', 'the menu opens from a trigger button')
-    assert.strictEqual(anchor.props['aria-haspopup'], 'menu')
-    assert.strictEqual(anchor.props.type, 'button')
+    // The composer seat must be gone: no hand-rolled menu, no status URL
+    // field, no connect button.
+    assert.ok(!source.includes('conversation.input.right'), 'the composer seat is removed')
+    assert.ok(!source.includes('ZenFamilyMenu'), 'the composer menu component is removed')
+    assert.ok(!/statusUrl|Подключить/.test(source), 'no status-URL field or connect button')
 
     // A broken settings shell must not take the whole web entry down.
     const warnings = []
@@ -1087,7 +1072,7 @@ async function runQuotaTests() {
     } finally {
       console.warn = previousWarn
     }
-    assert.strictEqual(warnings.length, 2, 'every seat reports instead of throwing')
+    assert.strictEqual(warnings.length, 1, 'the seat reports instead of throwing')
     for (const warning of warnings) assert.match(warning, /slot .* unavailable/)
   })
 
