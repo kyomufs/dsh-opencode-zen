@@ -871,6 +871,52 @@ async function runQuotaTests() {
     await pool.close()
   })
 
+  await checkAsync('toPlainFetchArgs flattens a foreign Request for undici.fetch', async () => {
+    const [url, init] = plugin.toPlainFetchArgs(
+      new Request('https://opencode.ai/zen/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"a":1}',
+      }),
+      undefined,
+    )
+    assert.strictEqual(url, 'https://opencode.ai/zen/v1/chat/completions')
+    assert.strictEqual(init.method, 'POST')
+    assert.strictEqual(new Headers(init.headers).get('content-type'), 'application/json')
+    // Request bodies are streams; undici needs an explicit duplex flag for them
+    assert.ok(init.body != null, 'body is carried over')
+    assert.strictEqual(init.duplex, 'half')
+    const [url2, init2] = plugin.toPlainFetchArgs('https://opencode.ai/zen/v1/x', { method: 'GET' })
+    assert.strictEqual(url2, 'https://opencode.ai/zen/v1/x')
+    assert.strictEqual(init2.method, 'GET')
+  })
+
+  await checkAsync('patchFetch routes pinned zen requests through the pooled fetch', async () => {
+    const calls = []
+    const dispatcher = { pinned: true }
+    const patched = plugin.patchFetch(
+      async () => { calls.push('original'); return new Response('{}', { status: 200 }) },
+      { getStore: () => null },
+      {
+        dispatcherFor: () => dispatcher,
+        dispatcherFetch: async (url, init) => { calls.push({ url, init }); return new Response('{}', { status: 200 }) },
+      },
+    )
+    await patched('https://example.com/v1/chat', { method: 'GET' })
+    await patched('https://opencode.ai/zen/v1/chat/completions', { method: 'POST', body: '{}' })
+    assert.deepStrictEqual(calls.map((c) => (typeof c === 'string' ? c : 'pooled')), ['original', 'pooled'])
+    assert.strictEqual(calls[1].url, 'https://opencode.ai/zen/v1/chat/completions')
+    assert.strictEqual(calls[1].init.dispatcher, dispatcher)
+    // without a pooled fetch the patch degrades to the original fetch
+    const degraded = plugin.patchFetch(
+      async () => new Response('{}', { status: 200 }),
+      { getStore: () => null },
+      { dispatcherFor: () => dispatcher },
+    )
+    const ok = await degraded('https://opencode.ai/zen/v1/chat/completions', { method: 'POST' })
+    assert.strictEqual(ok.status, 200)
+  })
+
   await checkAsync('zenProbe sends the CLI disguise headers and the gate tools', async () => {
     let seen = null
     const result = await plugin.zenProbe({
