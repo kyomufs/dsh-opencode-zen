@@ -750,7 +750,6 @@ async function runQuotaTests() {
   const fs = require('node:fs')
   const path = require('node:path')
   const { createQuotaStore, dayKey, nextReset, normalizeFamily } = require('../lib/quota.js')
-  const { createStatusServer } = require('../lib/status.js')
   const quotaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zen-quota-'))
   const quotaFile = path.join(quotaDir, 'quota.json')
   const day = Date.UTC(2026, 9, 2, 21, 0, 0)
@@ -814,12 +813,10 @@ async function runQuotaTests() {
     assert.strictEqual(tomorrow.snapshot({}).buckets.ipv4.ok, 0)
   })
 
-  check('quota config defaults to auto family on port 47821', () => {
+  check('quota config defaults to auto family', () => {
     const config = plugin.resolveQuotaConfig({})
     assert.strictEqual(config.family, 'auto')
     assert.strictEqual(config.familyLocked, false)
-    assert.strictEqual(config.statusPort, 47821)
-    assert.strictEqual(config.probeModel, 'big-pickle')
   })
 
   check('an explicit config family locks the panel toggle', () => {
@@ -902,10 +899,11 @@ async function runQuotaTests() {
         dispatcherFetch: async (url, init) => { calls.push({ url, init }); return new Response('{}', { status: 200 }) },
       },
     )
+    const zenUrl = `${plugin.OPENCODE_BASE}/chat/completions`
     await patched('https://example.com/v1/chat', { method: 'GET' })
-    await patched('https://opencode.ai/zen/v1/chat/completions', { method: 'POST', body: '{}' })
+    await patched(zenUrl, { method: 'POST', body: '{}' })
     assert.deepStrictEqual(calls.map((c) => (typeof c === 'string' ? c : 'pooled')), ['original', 'pooled'])
-    assert.strictEqual(calls[1].url, 'https://opencode.ai/zen/v1/chat/completions')
+    assert.strictEqual(calls[1].url, zenUrl)
     assert.strictEqual(calls[1].init.dispatcher, dispatcher)
     // without a pooled fetch the patch degrades to the original fetch
     const degraded = plugin.patchFetch(
@@ -913,213 +911,8 @@ async function runQuotaTests() {
       { getStore: () => null },
       { dispatcherFor: () => dispatcher },
     )
-    const ok = await degraded('https://opencode.ai/zen/v1/chat/completions', { method: 'POST' })
+    const ok = await degraded(zenUrl, { method: 'POST' })
     assert.strictEqual(ok.status, 200)
-  })
-
-  await checkAsync('zenProbe sends the CLI disguise headers and the gate tools', async () => {
-    let seen = null
-    const result = await plugin.zenProbe({
-      model: 'big-pickle',
-      family: 'auto',
-      apiKey: 'public',
-      fetchImpl: async (url, init) => {
-        seen = { url, init }
-        return new Response('data: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } })
-      },
-    })
-    assert.ok(seen.url.endsWith('/chat/completions'))
-    assert.strictEqual(seen.init.headers.authorization, 'Bearer public')
-    assert.strictEqual(seen.init.headers['user-agent'], 'opencode/1.18.34')
-    assert.strictEqual(seen.init.headers['x-opencode-client'], 'cli')
-    assert.match(seen.init.headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
-    const body = JSON.parse(seen.init.body)
-    assert.deepStrictEqual(body.tools.map((tool) => tool.function.name), ['bash', 'read'])
-    assert.strictEqual(result.status, 200)
-    assert.strictEqual(result.dailyLimit, false)
-  })
-
-  await checkAsync('zenProbe can carry a spoofed x-real-ip for the A/B', async () => {
-    let seen = null
-    await plugin.zenProbe({
-      model: 'big-pickle',
-      family: 'ipv4',
-      spoofIp: '198.51.100.77',
-      fetchImpl: async (url, init) => {
-        seen = init.headers
-        return new Response('{}', { status: 200 })
-      },
-    })
-    assert.strictEqual(seen['x-real-ip'], '198.51.100.77')
-  })
-
-  await checkAsync('zenProbe classifies the daily quota rejection', async () => {
-    const body = JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded.' } })
-    const result = await plugin.zenProbe({
-      model: 'mimo-v2.6-flash-free',
-      family: 'ipv6',
-      fetchImpl: async () => new Response(body, { status: 429 }),
-    })
-    assert.strictEqual(result.status, 429)
-    assert.strictEqual(result.type, 'FreeUsageLimitError')
-    assert.strictEqual(result.dailyLimit, true)
-  })
-
-  await checkAsync('a spoof that still answers 429 proves the edge wins', async () => {
-    const daily = new Response(
-      JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError' } }),
-      { status: 429 },
-    )
-    const result = await plugin.zenSpoofProbe({
-      model: 'big-pickle',
-      family: 'ipv4',
-      fetchImpl: async () => daily.clone(),
-    })
-    assert.strictEqual(result.probes.length, 3)
-    assert.match(result.verdict, /^NOT VULNERABLE/)
-  })
-
-  await checkAsync('a spoof that answers 200 on a dead bucket would be VULNERABLE', async () => {
-    let call = 0
-    const result = await plugin.zenSpoofProbe({
-      model: 'big-pickle',
-      family: 'ipv4',
-      fetchImpl: async () => {
-        call += 1
-        return call === 1
-          ? new Response(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError' } }), { status: 429 })
-          : new Response('data: [DONE]\n\n', { status: 200 })
-      },
-    })
-    assert.match(result.verdict, /^VULNERABLE/)
-  })
-
-  await checkAsync('status endpoint answers quota, family, probe and 404', async () => {
-    const status = createStatusServer({
-      port: 0,
-      getState: () => ({ family: 'ipv4', buckets: {} }),
-      setFamily: (family) => ({ family, locked: false }),
-      probe: async ({ family: probeFamily }) => ({ family: probeFamily, status: 200 }),
-      spoofProbe: async () => ({ verdict: 'NOT VULNERABLE', probes: [] }),
-    })
-    const { url } = await status.listen()
-    try {
-      const quota = await fetch(`${url}/zen/quota`)
-      assert.strictEqual(quota.status, 200)
-      assert.strictEqual((await quota.json()).family, 'ipv4')
-
-      const switched = await fetch(`${url}/zen/family`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ family: 'ipv6' }),
-      })
-      assert.strictEqual((await switched.json()).family, 'ipv6')
-
-      const probe = await fetch(`${url}/zen/probe`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ family: 'ipv4' }),
-      })
-      assert.strictEqual((await probe.json()).status, 200)
-
-      const spoof = await fetch(`${url}/zen/spoof`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: '{}',
-      })
-      assert.match((await spoof.json()).verdict, /NOT VULNERABLE/)
-
-      const missing = await fetch(`${url}/zen/nope`)
-      assert.strictEqual(missing.status, 404)
-    } finally {
-      await status.close()
-    }
-  })
-
-  await checkAsync('the web client registers its settings seat only', async () => {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
-    const noop = () => {}
-    const fakeReact = {
-      createElement: (type, props, ...children) => ({ type, props, children }),
-      useState: (initial) => [typeof initial === 'function' ? initial() : initial, noop],
-      useEffect: noop,
-      useRef: (initial) => ({ current: initial }),
-      useCallback: (fn) => fn,
-    }
-    const fakePrimitives = {
-      // Stable icon markers; the client only pulls the two icons it renders.
-      IconGlobeOutlineRegular: 'icon-globe',
-      IconClockOutlineRegular: 'icon-clock',
-    }
-    const fakeRequire = (specifier) => {
-      if (specifier === 'react') return fakeReact
-      if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return fakePrimitives
-      throw new Error(`unexpected require: ${specifier}`)
-    }
-    let exported = null
-    const fakeWindow = {
-      __ModuleLoader__: {
-        load({ id, factory }) {
-          assert.strictEqual(id, 'dsh-opencode-zen')
-          exported = factory(fakeRequire)
-        },
-      },
-    }
-    const fakeDocument = { readyState: 'complete', addEventListener: noop }
-    // eslint-disable-next-line no-new-func
-    new Function('window', 'document', source)(fakeWindow, fakeDocument)
-
-    assert.ok(exported, 'the loader factory must return the plugin exports')
-    assert.strictEqual(typeof exported.apply, 'function')
-    // Regression guard: the fiber resolves only the services named in `inject`,
-    // and a missing 'slots' entry made the client fail to activate at boot.
-    assert.deepStrictEqual(exported.inject, ['slots'])
-
-    const registrations = []
-    let currentSeat = null
-    const ctx = {
-      slots: {
-        inject(seat, register) { currentSeat = seat; register() },
-        register(descriptor, component) {
-          registrations.push({ seat: currentSeat, descriptor, component })
-          return descriptor
-        },
-      },
-    }
-    exported.apply(ctx)
-
-    // Since 0.15.0 the whole surface lives in Settings: the family switch
-    // moved out of the composer and diagnostics stay on the loopback
-    // endpoints, so exactly one seat is registered.
-    const seats = registrations.map((entry) => entry.seat)
-    assert.deepStrictEqual(seats, ['settings.section'])
-
-    const panel = registrations.find((entry) => entry.seat === 'settings.section')
-    assert.strictEqual(panel.descriptor.id, 'dsh-opencode-zen')
-    assert.strictEqual(typeof panel.descriptor.label, 'function')
-    assert.strictEqual(panel.descriptor.label(), 'OpenCode Zen')
-    assert.strictEqual(typeof panel.component, 'function')
-
-    // Rendering the surface with a stub React exercises the component body.
-    assert.strictEqual(panel.component().props.className, 'zen-panel')
-
-    // The composer seat must be gone: no hand-rolled menu, no status URL
-    // field, no connect button.
-    assert.ok(!source.includes('conversation.input.right'), 'the composer seat is removed')
-    assert.ok(!source.includes('ZenFamilyMenu'), 'the composer menu component is removed')
-    assert.ok(!/statusUrl|Подключить/.test(source), 'no status-URL field or connect button')
-
-    // A broken settings shell must not take the whole web entry down.
-    const warnings = []
-    const previousWarn = console.warn
-    console.warn = (...args) => warnings.push(args.join(' '))
-    try {
-      exported.apply({})
-    } finally {
-      console.warn = previousWarn
-    }
-    assert.strictEqual(warnings.length, 1, 'the seat reports instead of throwing')
-    for (const warning of warnings) assert.match(warning, /slot .* unavailable/)
   })
 
   fs.rmSync(quotaDir, { recursive: true, force: true })

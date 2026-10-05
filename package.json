@@ -8,9 +8,6 @@
     ".": {
       "default": "./lib/index.js"
     },
-    "./client": {
-      "default": "./lib/client.js"
-    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -24,9 +21,6 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web"
     }
   },
   "peerDependencies": {
