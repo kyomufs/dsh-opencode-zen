@@ -43,12 +43,32 @@
 
 const assert = require('node:assert')
 const http = require('node:http')
-const { mkdtempSync, rmSync } = require('node:fs')
+const Module = require('node:module')
+const { mkdtempSync, rmSync, readdirSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const { join } = require('node:path')
 
 // Host pins live in the immutable nix store — read-only, never assumed.
 const DSH_LIB = '/nix/store/qph9ndg6jv1q0gd819j7am0h7nhs8kpy-dsh-0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh'
+const DSH_LLM_ENTRY = join(DSH_LIB, 'node_modules/@deepseek-ai/dsh-llm/lib/index.js')
+
+// The plugin repo ships no node_modules for @deepseek-ai/dsh-llm, yet
+// providerRetryPolicy() MUST delegate to dsh-llm's resolveRetryPolicy (plan
+// Global Constraints). Mirror the host's resolution: while this suite runs,
+// the bare peer specifier resolves to the same nix-store pin the host loads.
+// `peerResolutionEnabled` lets the Task-2 suite prove that no hand-flattened
+// fallback hides behind the delegation (plan: resolveRetryPolicy ONLY).
+// Installed before the first require of ../lib/index.js.
+const nativeResolveFilename = Module._resolveFilename
+let peerResolutionEnabled = true
+Module._resolveFilename = function (request, ...rest) {
+  if (peerResolutionEnabled && request === '@deepseek-ai/dsh-llm') return DSH_LLM_ENTRY
+  return nativeResolveFilename.call(this, request, ...rest)
+}
+
+// Committed MODELS parity snapshot (extracted once from a416790 — header in
+// the fixture). Never git show at runtime, never ~/.dsh (plan Review Focus #5).
+const MODELS_FIXTURE = require(join(__dirname, 'fixtures', 'models-a416790.cjs'))
 
 // Plan Task 3 transport contract: OPENCODE_ZEN_BASE carries NO path; the
 // adapter appends CONTRACT_PATH itself.
@@ -259,14 +279,14 @@ const STREAMS = {
   },
   // Row 13 — stream death BEFORE any content (headers + a comment, then the
   // socket dies) → TIMEOUT.
-  'kill-precontent'(req, res) {
+  'kill-precontent'(res) {
     res.writeHead(200, SSE_HEADERS)
     res.write(': prime\n\n')
     const timer = setTimeout(() => { res.socket.destroy() }, 120)
     res.on('close', () => clearTimeout(timer))
   },
   // Row 15 — premature close AFTER content, abnormal EOF.
-  'kill-after-content'(req, res) {
+  'kill-after-content'(res) {
     res.writeHead(200, SSE_HEADERS)
     chunkFrame(res, { role: 'assistant' })
     chunkFrame(res, { content: 'partial' })
@@ -274,7 +294,7 @@ const STREAMS = {
     res.on('close', () => clearTimeout(timer))
   },
   // Row 15 — premature close AFTER content, clean FIN with [DONE] missing.
-  'clean-end-after-content'(req, res) {
+  'clean-end-after-content'(res) {
     res.writeHead(200, SSE_HEADERS)
     chunkFrame(res, { role: 'assistant' })
     chunkFrame(res, { content: 'partial' })
@@ -282,7 +302,7 @@ const STREAMS = {
   },
   // Delivers one content chunk immediately; the tail (more content, finish,
   // usage, [DONE]) lands 400 ms later — used by the mid-flight abort row.
-  slow(req, res) {
+  slow(res) {
     res.writeHead(200, SSE_HEADERS)
     chunkFrame(res, { role: 'assistant' })
     chunkFrame(res, { content: 'first' })
@@ -311,7 +331,7 @@ const STREAMS = {
     res.end()
   },
   // Row 10 — socket dies before any status line reaches the client.
-  'reset-preheaders'(req, res) {
+  'reset-preheaders'(res) {
     res.socket.destroy()
   },
 }
@@ -345,7 +365,10 @@ const server = http.createServer((req, res) => {
       return
     }
     const stream = STREAMS[scenario.name]
-    if (stream) return stream(req, res)
+    // Stream fixtures take (res) only — none of them read req. (Pre-Task-3
+    // runs never reached this branch: the base HEAD always posted a different
+    // path, so the latent arity mismatch stayed unexercised.)
+    if (stream) return stream(res)
     return guard(`unknown scenario "${scenario.name}"`)
   })
 })
@@ -377,9 +400,11 @@ async function closedPort() {
 function makeCtx() {
   const registrations = []
   const effectFactories = []
+  const listeners = []
   return {
     registrations,
     effectFactories,
+    listeners,
     llm: { registerAdapter(routes, adapter) { registrations.push({ routes, adapter }) } },
     logger: { info() {}, warn() {}, error() {} },
     // cordis effects install side effects — the base implementation patches
@@ -387,7 +412,10 @@ function makeCtx() {
     // it: every check stays hermetic and ~/.dsh-facing setup stays dormant
     // (Task 6 owns apply()-side behavior).
     effect(factory) { effectFactories.push(factory) },
-    on() {},
+    // Record subscribed events too: Task 2 proves apply() installs no
+    // listeners (the base hooked ctx.on('llm/stream')); Task 6 owns the
+    // apply()-side health listener when it arrives.
+    on(event) { listeners.push(event) },
     get() { return undefined },
   }
 }
@@ -554,6 +582,244 @@ async function run() {
     assert.strictEqual(llm.QUOTA_EXCEEDED_CODE, 'QUOTA')
     assert.strictEqual(llm.EMPTY_RESPONSE_CODE, 'EMPTY_RESPONSE')
     assert.strictEqual(llm.INVALID_CREDENTIAL_CODE, 'INVALID_CREDENTIAL')
+  })
+
+  // ------------------------------------------------- Task 2: static shell --
+  console.log('\n[Task 2 — module skeleton + static models]')
+
+  // listModels() contract: a dedicated loopback catalog server — never the
+  // fixture daemon, whose request counter backs the Task-1 rows. One mode
+  // switches the failure surface per scenario.
+  let modelsMode = 'ok'
+  const staticModelInfos = () => MODELS_FIXTURE.map((m) => ({
+    provider: TEST_PROVIDER,
+    id: m.id,
+    name: m.name,
+    description: m.description,
+    inputModalities: m.vision === true ? ['text', 'image'] : ['text'],
+  }))
+  const modelsServer = http.createServer((req, res) => {
+    const json = (status, body) => {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(body)
+    }
+    if (req.method !== 'GET' || req.url !== '/v1/models') return json(404, '{"error":"not found"}')
+    switch (modelsMode) {
+      case 'fivehundred': return json(500, 'Internal server error')
+      case 'garbage-json': return json(200, '<html>definitely not JSON</html>')
+      case 'wrong-shape': return json(200, JSON.stringify({ object: 'list', models: [] }))
+      case 'empty': return json(200, JSON.stringify({ object: 'list', data: [] }))
+      case 'partial': {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.write('{"object":"list","data":[{')
+        res.socket.destroy()
+        return
+      }
+      case 'hang': return // never answers: AbortSignal.timeout must cut it off
+      case 'guard428': return json(428, JSON.stringify({ error: { message: 'unsupported' } }))
+      case 'subset':
+        return json(200, JSON.stringify({ object: 'list', data: [{ id: 'big-pickle' }, { id: 'mimo-v2.6-flash-free' }] }))
+      default: {
+        const data = MODELS_FIXTURE.map((m) => ({ id: m.id, object: 'model', created: 1759718400, owned_by: 'opencode' }))
+        data.push({ id: 'zen-live-new', object: 'model', created: 1759718400, owned_by: 'opencode' })
+        return json(200, JSON.stringify({ object: 'list', data }))
+      }
+    }
+  })
+  await listen(modelsServer)
+  const liveAdapter = loadAdapter(`http://127.0.0.1:${modelsServer.address().port}`).adapter
+
+  check('[Task 2] plugin surface: name, inject, and the LlmAdapter routes on the registered adapter', () => {
+    assert.strictEqual(fixture.plugin.name, 'dsh-opencode-zen')
+    assert.deepStrictEqual(fixture.plugin.inject, ['llm'])
+    assert.strictEqual(typeof fixture.plugin.apply, 'function')
+    for (const method of ['providerInfo', 'providerRetryPolicy', 'imageRequestPricing', 'listModels', 'resolveModel', 'prepareCall', 'stream']) {
+      assert.strictEqual(typeof fixture.adapter[method], 'function', `the registered adapter must expose ${method}()`)
+    }
+  })
+
+  check("[Task 2] exports: this plan's surface only — OPENCODE_ZEN_BASE in, transport/quota surface out", () => {
+    const exported = Object.keys(fixture.plugin).sort()
+    assert.deepStrictEqual(exported, ['MODELS', 'OPENCODE_ZEN_BASE', 'OpenCodeZenAdapter', 'PROVIDER', 'apply', 'inject', 'name'],
+      `module.exports must be exactly the plan surface; legacy entries: ${exported.filter((key) => !['MODELS', 'OPENCODE_ZEN_BASE', 'OpenCodeZenAdapter', 'PROVIDER', 'apply', 'inject', 'name'].includes(key)).join(', ') || '(none)'}`)
+    assert.ok(!('OPENCODE_BASE' in fixture.plugin), 'the transport-proxy OPENCODE_BASE name is gone; OPENCODE_ZEN_BASE carries NO path')
+    assert.ok(!('quotaFile' in fixture.plugin) && !('patchFetch' in fixture.plugin), 'quota/fetch-patch exports must be gone')
+  })
+
+  check('[Task 2] OPENCODE_ZEN_BASE defaults to http://127.0.0.1:8787 with no path (fresh require, env unset)', () => {
+    const saved = process.env.OPENCODE_ZEN_BASE
+    delete process.env.OPENCODE_ZEN_BASE
+    try {
+      delete require.cache[require.resolve('../lib/index.js')]
+      const fresh = require('../lib/index.js')
+      assert.strictEqual(fresh.OPENCODE_ZEN_BASE, 'http://127.0.0.1:8787',
+        'plan Task 3: default http://127.0.0.1:8787 — the base HEAD default http://127.0.0.1:8787/zen/v1 wrongly carried the proxy path')
+      assert.ok(!fresh.OPENCODE_ZEN_BASE.includes('/zen'), 'the default must not carry a path')
+    } finally {
+      if (saved === undefined) delete process.env.OPENCODE_ZEN_BASE
+      else process.env.OPENCODE_ZEN_BASE = saved
+    }
+  })
+
+  check('[Task 2] lib/ ships exactly index.js — quota.js deleted, client.js/status.js never return', () => {
+    const entries = readdirSync(join(__dirname, '..', 'lib')).sort()
+    assert.deepStrictEqual(entries, ['index.js'], `plan Task 7 greps ls lib/ → index.js only; found: ${entries.join(', ')}`)
+  })
+
+  check('[Task 2] apply() registers only: zero ctx.effect factories, zero ctx.on listeners', () => {
+    const ctx = makeCtx()
+    fixture.plugin.apply(ctx, { quotaFile: QUOTA_FILE })
+    assert.strictEqual(ctx.registrations.length, 1, 'apply() must register exactly one adapter')
+    assert.deepStrictEqual(ctx.registrations[0].routes, [TEST_PROVIDER])
+    assert.deepStrictEqual(ctx.effectFactories, [],
+      'apply() must install no cordis effects (the global fetch patch and quota store are gone)')
+    assert.deepStrictEqual(ctx.listeners, [],
+      "apply() must subscribe to no events (ctx.on('llm/stream') and the Task-6 health listener are gone/Task 6-owned)")
+  })
+
+  check('[Task 2] MODELS deep-equals the committed a416790 fixture; table vocabulary only (no output-only fields)', () => {
+    const table = fixture.plugin.MODELS
+    assert.strictEqual(table.length, 9, 'the a416790 table carries 9 entries')
+    assert.deepStrictEqual(table, MODELS_FIXTURE, 'MODELS must stay byte-equal to the committed fixture')
+    const vocabulary = ['id', 'name', 'contextWindow', 'maxOutput', 'description', 'vision', 'efforts', 'responses', 'reasoningRequired']
+    for (const entry of table) {
+      for (const key of Object.keys(entry)) {
+        assert.ok(vocabulary.includes(key), `MODELS entry ${entry.id}: key "${key}" is outside the table vocabulary`)
+      }
+      assert.ok(!('defaultMaxTokens' in entry), `${entry.id}: defaultMaxTokens is resolveModel() OUTPUT, not a table field`)
+      assert.ok(!('reasoning' in entry), `${entry.id}: reasoning.* is resolveModel() OUTPUT, not a table field`)
+    }
+  })
+
+  await checkAsync('[Task 2] resolveModel maps table fields to output fields (documented next to resolveModel)', async () => {
+    const mimo = await fixture.adapter.resolveModel(TEST_PROVIDER, 'mimo-v2.6-flash-free')
+    assert.strictEqual(mimo.provider, TEST_PROVIDER)
+    assert.strictEqual(mimo.id, 'mimo-v2.6-flash-free')
+    assert.strictEqual(mimo.name, 'MiMo 2.6 Flash (Free)')
+    assert.strictEqual(mimo.description, 'OpenCode Zen free')
+    assert.deepStrictEqual(mimo.inputModalities, ['text', 'image'], 'vision → image input modality')
+    assert.deepStrictEqual(mimo.context, { contextWindow: 200000 })
+    assert.strictEqual(mimo.defaultMaxTokens, 32000, 'maxOutput → defaultMaxTokens')
+    assert.deepStrictEqual(mimo.reasoning.efforts.map((level) => level.id), ['off', 'low', 'medium', 'high'], 'efforts → reasoning.efforts')
+    assert.strictEqual(mimo.reasoning.defaultEffort, 'high', 'DEFAULT_REASONING → defaultEffort')
+    for (const level of mimo.reasoning.efforts) {
+      assert.strictEqual(typeof level.name, 'string')
+      assert.ok(level.name.length > 0)
+      assert.strictEqual(typeof level.description, 'string')
+      assert.ok(level.description.length > 0)
+    }
+    const bunny = await fixture.adapter.resolveModel(TEST_PROVIDER, 'space-bunny-free')
+    assert.deepStrictEqual(bunny.reasoning.efforts.map((level) => level.id), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.strictEqual(bunny.defaultMaxTokens, 524288, 'space-bunny maxOutput → defaultMaxTokens')
+    const unknown = await fixture.adapter.resolveModel(TEST_PROVIDER, 'zen-unknown-model')
+    assert.strictEqual(unknown.name, 'zen-unknown-model', 'unknown id: name falls back to the id')
+    assert.deepStrictEqual(unknown.inputModalities, ['text'])
+    assert.deepStrictEqual(unknown.context, { contextWindow: 200000 }, 'unknown id: default context window')
+    assert.strictEqual(unknown.defaultMaxTokens, 32000, 'unknown id: DEFAULT_MAX_TOKENS')
+    assert.deepStrictEqual(unknown.reasoning.efforts.map((level) => level.id), ['off', 'low', 'high', 'max'], 'unknown id: DEFAULT_EFFORT_IDS ladder')
+    assert.strictEqual(unknown.reasoning.defaultEffort, 'high')
+  })
+
+  await checkAsync('[Task 2] adapter shell: providerInfo, imageRequestPricing undefined, prepareCall binds resolveModel + stream', async () => {
+    assert.deepStrictEqual(fixture.adapter.providerInfo(TEST_PROVIDER), { id: TEST_PROVIDER, name: 'OpenCode Zen' })
+    assert.strictEqual(fixture.adapter.imageRequestPricing(), undefined)
+    assert.strictEqual(fixture.adapter.imageRequestPricing(TEST_PROVIDER, 'big-pickle'), undefined,
+      'no provider-side image pricing → the meter keeps its neutral estimate')
+    const call = await fixture.adapter.prepareCall(TEST_PROVIDER, 'big-pickle')
+    assert.strictEqual(typeof call.stream, 'function', 'prepareCall must hand the host a stream() bound to this adapter')
+    assert.strictEqual(call.model.id, 'big-pickle')
+    assert.strictEqual(call.model.provider, TEST_PROVIDER)
+    assert.strictEqual(call.model.defaultMaxTokens, 32000)
+    assert.deepStrictEqual(call.model.context, { contextWindow: 200000 })
+  })
+
+  check("[Task 2] providerRetryPolicy is dsh-llm's resolveRetryPolicy output (flattened, frozen, no nested backoff)", () => {
+    const llm = require(DSH_LLM_ENTRY)
+    const expected = llm.resolveRetryPolicy({
+      mode: 'normal',
+      maxRetries: 3,
+      retryableCodes: ['RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE'],
+      backoff: { initialDelayMs: 800, maxDelayMs: 8000, jitterRatio: 0.2 },
+    }, 'dsh-opencode-zen: retryPolicy')
+    const policy = fixture.adapter.providerRetryPolicy(TEST_PROVIDER)
+    assert.deepStrictEqual(policy, expected, 'the adapter policy must be exactly what the nix-pin resolveRetryPolicy produces')
+    assert.strictEqual(policy.initialDelayMs, 800)
+    assert.strictEqual(policy.maxDelayMs, 8000)
+    assert.strictEqual(policy.jitterRatio, 0.2)
+    assert.ok(!('backoff' in policy),
+      'returning the nested config verbatim made dsh-llm-retry compute NaN localDelay and killed the turn (a416790 incident)')
+    assert.ok(Object.isFrozen(policy), 'the pin resolves a frozen policy')
+  })
+
+  check('[Task 2] without the host peer, providerRetryPolicy() → undefined — resolveRetryPolicy ONLY, no hand-flattened fallback', () => {
+    peerResolutionEnabled = false
+    try {
+      // Two caches must both go: require.cache for the plugin module itself,
+      // and require.cache for the peer entry. Node's Module._load keeps a
+      // per-parent-path resolution cache (keyed by parent.path + request, not
+      // by module identity), so a fresh lib/index.js instance at the same path
+      // would otherwise reuse the earlier successful peer resolution and never
+      // consult _resolveFilename — making the disabled flag invisible.
+      delete require.cache[require.resolve('../lib/index.js')]
+      delete require.cache[DSH_LLM_ENTRY]
+      const standalone = require('../lib/index.js')
+      const ctx = makeCtx()
+      standalone.apply(ctx)
+      const policy = ctx.registrations[0].adapter.providerRetryPolicy(TEST_PROVIDER)
+      assert.strictEqual(policy, undefined,
+        'no peer → no policy (the host then applies its normal defaults); a hand-flattened copy leaking here means resolveRetryPolicy is not the only source')
+    } finally {
+      peerResolutionEnabled = true
+    }
+  })
+
+  await checkAsync('[Task 2] listModels: daemon down → the static 9 with declared modalities (never rejects)', async () => {
+    const dead = await closedPort()
+    const downAdapter = loadAdapter(`http://127.0.0.1:${dead}`).adapter
+    const models = await downAdapter.listModels(TEST_PROVIDER)
+    assert.deepStrictEqual(models, staticModelInfos())
+  })
+
+  await checkAsync('[Task 2] listModels live refresh: GET /v1/models — live ids added, static metadata wins, live list replaces', async () => {
+    modelsMode = 'ok'
+    const live = await liveAdapter.listModels(TEST_PROVIDER)
+    assert.strictEqual(live.length, 10, '9 static ids + the live-only id from GET /v1/models')
+    const known = live.find((entry) => entry.id === 'mimo-v2.6-flash-free')
+    assert.deepStrictEqual(known,
+      { provider: TEST_PROVIDER, id: 'mimo-v2.6-flash-free', name: 'MiMo 2.6 Flash (Free)', description: 'OpenCode Zen free', inputModalities: ['text', 'image'] },
+      'known ids keep static metadata (name/description/modalities) — the wire only answers ids')
+    const unknown = live.find((entry) => entry.id === 'zen-live-new')
+    assert.deepStrictEqual(unknown,
+      { provider: TEST_PROVIDER, id: 'zen-live-new', name: 'zen-live-new', inputModalities: ['text'] },
+      'an id absent from the static table appears with conservative metadata')
+    modelsMode = 'subset'
+    const subset = await liveAdapter.listModels(TEST_PROVIDER)
+    assert.deepStrictEqual(subset.map((entry) => entry.id), ['big-pickle', 'mimo-v2.6-flash-free'],
+      'the live list REPLACES the catalog (served ids follow GET /v1/models order), merged with static metadata')
+    modelsMode = 'ok'
+  })
+
+  await checkAsync('[Task 2] listModels never rejects: every refresh failure (HTTP, body, shape, timeout, refused) falls back to the static 9', async () => {
+    const expected = staticModelInfos()
+    for (const mode of ['fivehundred', 'garbage-json', 'wrong-shape', 'empty', 'partial', 'hang', 'guard428']) {
+      modelsMode = mode
+      let models
+      try {
+        models = await liveAdapter.listModels(TEST_PROVIDER)
+      } catch (error) {
+        assert.fail(`listModels() must NEVER reject — scenario "${mode}" threw: ${error && error.message}`)
+      }
+      assert.deepStrictEqual(models, expected, `scenario "${mode}": the refresh must fall back to the static table`)
+    }
+    modelsMode = 'ok'
+    const dead = await closedPort()
+    const downAdapter = loadAdapter(`http://127.0.0.1:${dead}`).adapter
+    assert.deepStrictEqual(await downAdapter.listModels(TEST_PROVIDER), expected, 'connection refused → static table')
+  })
+
+  await new Promise((resolve) => {
+    modelsServer.closeAllConnections()
+    modelsServer.close(resolve)
   })
 
   console.log('\n[Task 3 — transport contract]')
