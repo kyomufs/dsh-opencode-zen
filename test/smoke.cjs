@@ -482,6 +482,19 @@ function assertSingleRequest() {
   assert.strictEqual(scenario.hits, 1, 'exactly one attempt — the thin adapter must not retry in-process (plan Global Constraints)')
 }
 
+// Fix round 1 (F5): EXACT request-header key set — brief: "that one header,
+// nothing else". scenario.last.headers is Node's raw req.headers (the fixture
+// records it verbatim), so it holds the adapter-owned keys PLUS undici's
+// transport defaults that no adapter code sets (probed against this Node
+// build: host, connection, content-length, accept, accept-language,
+// sec-fetch-mode, accept-encoding). Whitelist those; every other key must be
+// one of content-type + user-agent (+ authorization when OPENCODE_ZEN_API_KEY
+// is set) — the exact-key assertions below fail on any stray header.
+const FETCH_TRANSPORT_KEYS = ['accept', 'accept-encoding', 'accept-language', 'connection', 'content-length', 'host', 'sec-fetch-mode']
+function adapterHeaderKeys(headers) {
+  return Object.keys(headers).filter((key) => !FETCH_TRANSPORT_KEYS.includes(key)).sort()
+}
+
 // Row contract for every thrown failure: own `code` + own `failure` snapshot
 // agreeing, status/providerRetryAfterMs exactly as the row prescribes, and a
 // host normalizeLlmFailure pass (the bare-code → UNKNOWN trap).
@@ -889,6 +902,39 @@ async function run() {
     assert.ok(!('reasoning_effort' in body), 'effort is sent only when the host asked for one')
   })
 
+  // Fix round 1 (F3): brief box 3 demands BOTH tool-result shapes. The check
+  // above pins the host's message-level role:'tool'; this pins the LEGACY
+  // shape — embedded `tool-result` blocks inside a user message
+  // (lib/index.js:197-199 → pushToolResult), which was implemented but had no
+  // fixture. Written as a PIN: green on arrival by design (the behavior
+  // already existed) — it turns RED if the legacy branch regresses.
+  await checkAsync("[Task 3] serializer legacy shape: embedded tool-result blocks in a user message → role:tool (dual-shape pin)", async () => {
+    resetScenario('ok')
+    const { error } = await attempt(adapter, baseOptions({
+      system: undefined,
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', id: 'call_legacy', name: 'read_file', arguments: '{"path":"b.txt"}' }] },
+        { role: 'user', content: [
+          { type: 'text', text: 'thanks' },
+          { type: 'tool-result', toolCallId: 'call_legacy', content: [{ type: 'text', text: 'legacy contents' }] },
+        ] },
+      ],
+    }))
+    assertContractRequest()
+    assertSingleRequest()
+    if (error) assert.fail(`expected the happy stream to finish, got ${error.code || error.message}`)
+    const body = scenario.last.body
+    const roles = body.messages.map((message) => message.role)
+    assert.deepStrictEqual(roles, ['assistant', 'user', 'tool'],
+      "wire roles: the user text keeps role:'user', the embedded tool-result becomes its own role:'tool' message AFTER it (lib/index.js:197-199)")
+    assert.deepStrictEqual(body.messages[1], { role: 'user', content: 'thanks' },
+      'the user text before the embedded tool-result stays a user message')
+    assert.deepStrictEqual(body.messages[2],
+      { role: 'tool', tool_call_id: 'call_legacy', content: 'legacy contents' },
+      "legacy embedded tool-result → role:'tool' carrying the BLOCK's toolCallId and flattened text")
+    assert.ok(!roles.includes('reasoning'), 'brief: reasoning must never become its own wire role')
+  })
+
   await checkAsync("[Task 3] attribution + key optionality: user-agent equals dsh-llm attributionHeaders() (that one header); OPENCODE_ZEN_API_KEY never required", async () => {
     const llm = require(join(DSH_LIB, 'node_modules/@deepseek-ai/dsh-llm/lib/index.js'))
     const attribution = llm.attributionHeaders()
@@ -897,14 +943,20 @@ async function run() {
     delete process.env.OPENCODE_ZEN_API_KEY
     resetScenario('ok')
     await attempt(adapter, baseOptions())
+    assertContractRequest() // fix round 1: this check's request is contract-path too (see §1 list)
     const bare = scenario.last.headers
     assert.strictEqual(bare['user-agent'], expectedUA, 'the loopback hop carries exactly the dsh-llm attribution user-agent')
     assert.ok(!('authorization' in bare), 'OPENCODE_ZEN_API_KEY unset → no Authorization header (accepted, never required)')
+    assert.deepStrictEqual(adapterHeaderKeys(bare), ['content-type', 'user-agent'],
+      'F5 exact header set: key unset → the adapter sends EXACTLY content-type + user-agent (any other adapter-owned header fails here)')
     process.env.OPENCODE_ZEN_API_KEY = 'zen-test-key'
     try {
       resetScenario('ok')
       await attempt(adapter, baseOptions())
+      assertContractRequest()
       assert.strictEqual(scenario.last.headers.authorization, 'Bearer zen-test-key', 'a set OPENCODE_ZEN_API_KEY rides as a Bearer token')
+      assert.deepStrictEqual(adapterHeaderKeys(scenario.last.headers), ['authorization', 'content-type', 'user-agent'],
+        'F5 exact header set: key set → the adapter sends EXACTLY authorization + content-type + user-agent (no extras)')
       assertSingleRequest()
     } finally {
       delete process.env.OPENCODE_ZEN_API_KEY
