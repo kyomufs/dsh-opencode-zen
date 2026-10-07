@@ -330,6 +330,17 @@ const STREAMS = {
     usageFrame(res, { prompt_tokens: 5, completion_tokens: 0, total_tokens: 5 })
     res.end()
   },
+  // Task 4 — [DONE] missing after a full stream: the daemon's normal frames
+  // (finish frame, then usage frame), then a clean FIN without the
+  // terminator — clean end must still terminate with usage before finish.
+  'no-done'(res) {
+    res.writeHead(200, SSE_HEADERS)
+    chunkFrame(res, { role: 'assistant' })
+    chunkFrame(res, { content: 'Hello' })
+    finishFrame(res, 'stop')
+    usageFrame(res, { prompt_tokens: 6, completion_tokens: 2, total_tokens: 8 })
+    res.end()
+  },
   // Row 10 — socket dies before any status line reaches the client.
   'reset-preheaders'(res) {
     res.socket.destroy()
@@ -1057,6 +1068,31 @@ async function run() {
     assert.deepStrictEqual(chunks[3].usage, { inputTokens: 3, outputTokens: 1, totalTokens: 4 })
     assertExactDefinedKeys(chunks[3].usage, ['inputTokens', 'outputTokens', 'totalTokens'], 'usage')
     assert.deepStrictEqual(chunks[4].reason, { kind: 'stop' })
+    assertSingleRequest()
+  })
+
+  await checkAsync('[Task 4] [DONE] missing after a full stream → clean end still terminates: usage before exactly one finish', async () => {
+    resetScenario('no-done')
+    const { chunks, error } = await attempt(adapter, baseOptions())
+    assertContractRequest()
+    if (error) assert.fail(`expected no failure, got ${error.code || error.message}`)
+    assert.deepStrictEqual(chunks.map((c) => c.type),
+      ['block-start', 'text-delta', 'block-end', 'usage', 'finish'])
+    assert.deepStrictEqual(chunks[3].usage, { inputTokens: 6, outputTokens: 2, totalTokens: 8 })
+    assert.deepStrictEqual(chunks[4].reason, { kind: 'stop' })
+    assertSingleRequest()
+  })
+
+  await checkAsync('[Task 4] salvage: socket killed AFTER content → block-end (partial carried) precedes exactly one finish', async () => {
+    resetScenario('kill-after-content')
+    const { chunks, error } = await attempt(adapter, baseOptions())
+    assertContractRequest()
+    if (error) assert.fail(`salvage must not throw: ${error.code || error.message}: ${error.message}`)
+    const types = chunks.map((c) => c.type)
+    assert.deepStrictEqual(types, ['block-start', 'text-delta', 'block-end', 'finish'])
+    assert.strictEqual(types.filter((t) => t === 'finish').length, 1, 'exactly one finish')
+    assert.deepStrictEqual(chunks[2], { type: 'block-end', index: 0, block: { type: 'text', text: 'partial' } })
+    assert.strictEqual(types.indexOf('block-end') < types.indexOf('finish'), true, 'block-end precedes finish')
     assertSingleRequest()
   })
 
