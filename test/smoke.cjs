@@ -1234,13 +1234,13 @@ async function run() {
   })
 
   await expectRow(adapter, 'row 13: stream death BEFORE any content → TIMEOUT, no replay', {
-    scenarioName: 'kill-precontent', expected: { code: 'TIMEOUT', retryAfterMs: 'absent' }, chunks: [],
+    scenarioName: 'kill-precontent', expected: { code: 'TIMEOUT', status: 200, retryAfterMs: 'absent' }, chunks: [],
   })
   await expectRow(adapter, 'row 14: clean [DONE] termination with zero content → EMPTY_RESPONSE', {
-    scenarioName: 'zero-done', expected: { code: 'EMPTY_RESPONSE', retryAfterMs: 'absent' }, chunks: [],
+    scenarioName: 'zero-done', expected: { code: 'EMPTY_RESPONSE', status: 200, retryAfterMs: 'absent' }, chunks: [],
   })
   await expectRow(adapter, 'row 14: clean end (no [DONE]) with zero content → EMPTY_RESPONSE', {
-    scenarioName: 'zero-end', expected: { code: 'EMPTY_RESPONSE', retryAfterMs: 'absent' }, chunks: [],
+    scenarioName: 'zero-end', expected: { code: 'EMPTY_RESPONSE', status: 200, retryAfterMs: 'absent' }, chunks: [],
   })
 
   // Row 10, connection refused: a second adapter instance pointed at a
