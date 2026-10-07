@@ -467,6 +467,15 @@ function assertContractRequest() {
   assert.ok(request, 'the fixture daemon received no request — the adapter must POST the contract path')
   assert.strictEqual(request.path, CONTRACT_PATH, `plan Task 3 contract: POST ${CONTRACT_PATH}; got ${request.method} ${request.path}`)
   assert.strictEqual(request.method, 'POST', `plan Task 3 contract: POST ${CONTRACT_PATH}; got ${request.method} ${request.path}`)
+  // Task 3 body-shape gate (ruling B): stream:true only, stream_options OMITTED
+  // (the daemon force-writes it, internal/gateway/handler.go:204), no
+  // stream:false anywhere, and the serializer's messages[] rides along.
+  const body = request.body
+  assert.ok(body && typeof body === 'object', 'plan Task 3: the POST carries a parsed JSON body')
+  assert.strictEqual(body.stream, true, 'plan Task 3 checkbox 2: send stream:true')
+  assert.ok(!('stream_options' in body), 'plan Task 3 checkbox 2: OMIT stream_options — the daemon force-writes it (internal/gateway/handler.go:204)')
+  assert.ok(!JSON.stringify(body).includes('"stream":false'), 'plan Task 3: stream:false must never appear anywhere in the body')
+  assert.ok(Array.isArray(body.messages), 'plan Task 3 checkbox 3: the serializer emits a messages[] array')
 }
 
 function assertSingleRequest() {
@@ -830,6 +839,84 @@ async function run() {
     assertContractRequest()
     if (error) assert.fail(`expected the happy stream to reach content, got ${error.code || error.message}`)
     assertSingleRequest()
+  })
+
+  await checkAsync('[Task 3] serializer shapes each content kind: system fold, image data URL, reasoning+tool_calls, tool-result → role tool (never a reasoning role)', async () => {
+    resetScenario('ok')
+    const fixture = loadAdapter(baseUrl)
+    fixture.ctx.get = (key) => (key === 'attachments'
+      ? { readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), ref: { mediaType: 'image/png' } }) }
+      : undefined)
+    const pngBase64 = Buffer.from([137, 80, 78, 71]).toString('base64')
+    const { error } = await attempt(fixture.adapter, baseOptions({
+      system: undefined,
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'Be terse.' }] },
+        { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', attachment: { id: 'att-1' } }] },
+        { role: 'assistant', content: [
+          { type: 'reasoning', text: 'plan first' },
+          { type: 'text', text: 'reading' },
+          { type: 'tool-call', id: 'call_1', name: 'read_file', arguments: '{"path":"a.txt"}' },
+        ] },
+        { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: 'file contents' }, { type: 'image', attachment: { id: 'att-2' } }] },
+        { role: 'user', content: [{ type: 'text', text: 'done' }] },
+      ],
+      tools: [{ name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
+    }))
+    assertContractRequest()
+    assertSingleRequest()
+    if (error) assert.fail(`expected the happy stream to finish, got ${error.code || error.message}`)
+    const body = scenario.last.body
+    const roles = body.messages.map((message) => message.role)
+    assert.deepStrictEqual(roles, ['system', 'user', 'assistant', 'tool', 'user'],
+      'wire roles: system, user (+image), assistant, tool, user (+flushed tool image)')
+    assert.deepStrictEqual(body.messages[0], { role: 'system', content: 'Be terse.' }, 'system prompt → system message')
+    assert.deepStrictEqual(body.messages[1],
+      { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image_url', image_url: { url: `data:image/png;base64,${pngBase64}` } }] },
+      'image block → image_url data URL part inside the user message')
+    assert.deepStrictEqual(body.messages[2],
+      { role: 'assistant', content: 'reading', reasoning_content: 'plan first', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }] },
+      'assistant folds reasoning_content + tool_calls — reasoning is NEVER its own role')
+    assert.deepStrictEqual(body.messages[3], { role: 'tool', tool_call_id: 'call_1', content: 'file contents' },
+      "tool-result → role 'tool' carrying the message-level toolCallId")
+    assert.deepStrictEqual(body.messages[4].content[0], { type: 'text', text: 'done' }, 'the trailing user keeps its text first')
+    assert.strictEqual(body.messages[4].content[1].type, 'image_url',
+      'tool-result image rides the NEXT user message (tool messages carry text only)')
+    assert.ok(!roles.includes('reasoning'), 'brief: reasoning must never become its own wire role')
+    assert.deepStrictEqual(body.tools,
+      [{ type: 'function', function: { name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }],
+      'tools → OpenAI function entries with the parameters schema preserved')
+    assert.ok(!('reasoning_effort' in body), 'effort is sent only when the host asked for one')
+  })
+
+  await checkAsync("[Task 3] attribution + key optionality: user-agent equals dsh-llm attributionHeaders() (that one header); OPENCODE_ZEN_API_KEY never required", async () => {
+    const llm = require(join(DSH_LIB, 'node_modules/@deepseek-ai/dsh-llm/lib/index.js'))
+    const attribution = llm.attributionHeaders()
+    assert.deepStrictEqual(Object.keys(attribution), ['user-agent'], 'attributionHeaders() hands back the single user-agent header')
+    const expectedUA = attribution['user-agent']
+    delete process.env.OPENCODE_ZEN_API_KEY
+    resetScenario('ok')
+    await attempt(adapter, baseOptions())
+    const bare = scenario.last.headers
+    assert.strictEqual(bare['user-agent'], expectedUA, 'the loopback hop carries exactly the dsh-llm attribution user-agent')
+    assert.ok(!('authorization' in bare), 'OPENCODE_ZEN_API_KEY unset → no Authorization header (accepted, never required)')
+    process.env.OPENCODE_ZEN_API_KEY = 'zen-test-key'
+    try {
+      resetScenario('ok')
+      await attempt(adapter, baseOptions())
+      assert.strictEqual(scenario.last.headers.authorization, 'Bearer zen-test-key', 'a set OPENCODE_ZEN_API_KEY rides as a Bearer token')
+      assertSingleRequest()
+    } finally {
+      delete process.env.OPENCODE_ZEN_API_KEY
+    }
+  })
+
+  await checkAsync('[Task 3] zero retry: an HTTP 500 answers exactly one attempt — no in-process replay', async () => {
+    resetScenario('500-server')
+    const { error } = await attempt(adapter, baseOptions())
+    assertContractRequest()
+    assertSingleRequest()
+    assert.ok(error, 'the 500 must surface as a thrown failure (its mapping lands in Task 5)')
   })
 
   console.log('\n[Task 4 — SSE translator]')
