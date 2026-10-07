@@ -201,6 +201,7 @@ const HTTP_ERRORS = {
   '500-bare': { status: 500, body: { error: { message: 'internal server error' } } },
   '502-transport': { status: 502, body: envelope('TransportError', 'upstream relay failed') },
   '503-internal': { status: 503, body: envelope('InternalError', 'upstream 503') },
+  '504-relay': { status: 504, body: envelope('ProviderRelayError', 'upstream relay 504') },
   // Row 11 — unmatched statuses (unreachable per spec §9, but the safety
   // default must hold): wrong status never matches a row even when the type
   // does, and a free-tier 403 is not a region/policy 403.
@@ -512,9 +513,12 @@ function assertExactDefinedKeys(obj, expected, what) {
 
 // ------------------------------------------------------------------- run ---
 async function run() {
-  // Every fixture answers within ~400 ms. The base HEAD's in-process retry
-  // loop (MAX_REQUEST_ATTEMPTS = 2) adds at most one 15 s RATE_LIMIT sleep
-  // per row, so 300 s is a generous ceiling that still catches a hang.
+  // Every fixture answers within ~400 ms, and the whole RED run finishes in
+  // about a second: the wrong-path 428 guard maps to NON-retryable
+  // PROVIDER_ERROR (lib/index.js:730 httpFailure default; not in
+  // RETRYABLE_INNER), so NO retry sleep ever runs at RED (measured: ~0.7-1 s,
+  // exit 1). The 300 s unref'd watchdog only guards a hang — e.g. a wedged
+  // GREEN implementation stalling mid-stream — not the failure path.
   const watchdog = setTimeout(() => {
     console.error('FATAL: test stand exceeded the 300s watchdog')
     process.exit(1)
@@ -601,6 +605,8 @@ async function run() {
       ['reasoning', 'text', 'tool-call'])
     assert.strictEqual(chunks[1].text, 'think hard')
     assert.strictEqual(chunks[2].text, ' more')
+    assert.strictEqual(chunks[1].index, 0, 'reasoning deltas carry the reasoning block index')
+    assert.strictEqual(chunks[2].index, 0, 'reasoning deltas carry the reasoning block index')
     assert.deepStrictEqual(chunks[3], { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'think hard more' } })
     assert.deepStrictEqual(chunks[5], { type: 'text-delta', index: 1, text: 'answer' })
     assert.deepStrictEqual(chunks[6], { type: 'block-end', index: 1, block: { type: 'text', text: 'answer' } })
@@ -608,6 +614,21 @@ async function run() {
     assert.strictEqual(toolDeltas.length, 3, 'the tool metadata chunk and both argument fragments each yield a tool-call-delta')
     assert.strictEqual(toolDeltas[0].id, 'call_1', 'the metadata chunk carries the tool id')
     assert.strictEqual(toolDeltas[0].name, 'read_file', 'the metadata chunk carries the tool name')
+    // Strict field-presence check: `argumentsDelta` is REQUIRED on every
+    // tool-call-delta (dsh-llm types.d.ts StreamChunk union; the host's
+    // AssistantStreamAccumulator throws unless it is a string). The join('')
+    // below renders a MISSING field as '', so it alone would let an adapter
+    // omit argumentsDelta entirely — this strictEqual fails on that omission.
+    assert.strictEqual(toolDeltas[0].argumentsDelta, '', 'the metadata chunk carries argumentsDelta as a PRESENT empty string')
+    // Whole-frame exactness: the three deltas must match the host StreamChunk
+    // shape byte for byte — `id` required on every delta (host runtime throws
+    // on a non-string id), `name` only on the metadata chunk, fragments carry
+    // only the argument slice.
+    assert.deepStrictEqual(toolDeltas, [
+      { type: 'tool-call-delta', index: 2, id: 'call_1', name: 'read_file', argumentsDelta: '' },
+      { type: 'tool-call-delta', index: 2, id: 'call_1', argumentsDelta: '{"path"' },
+      { type: 'tool-call-delta', index: 2, id: 'call_1', argumentsDelta: ':"a"}' },
+    ], 'each tool-call-delta matches the host StreamChunk shape exactly (an omitted/undefined argumentsDelta fails here too)')
     assert.strictEqual(toolDeltas.map((d) => d.argumentsDelta).join(''), '{"path":"a"}')
     for (const delta of toolDeltas) assert.strictEqual(delta.index, 2, 'every tool delta uses the tool block index')
     assert.deepStrictEqual(chunks[11], {
@@ -727,6 +748,9 @@ async function run() {
   })
   await expectRow(adapter, 'row 9: 503 + InternalError → SERVER', {
     scenarioName: '503-internal', expected: { code: 'SERVER', status: 503, retryAfterMs: 'absent' },
+  })
+  await expectRow(adapter, 'row 9: 504 + ProviderRelayError → SERVER', {
+    scenarioName: '504-relay', expected: { code: 'SERVER', status: 504, retryAfterMs: 'absent' },
   })
 
   await expectRow(adapter, 'row 11: 402 + PaymentRequiredError (unmatched status) → PROVIDER_ERROR safety default', {
