@@ -30,10 +30,10 @@
  * The fake daemon binds 127.0.0.1 only — no opencode.ai traffic. Zero new
  * deps; the runner contract is unchanged (npm test → node test/smoke.cjs).
  *
- * ~/.dsh isolation: the plugin resolves its pool file from $DSH_HOME and its
- * quota store from $DSH_HOME/state/... unless overridden. Both are pinned
- * into a temp dir BEFORE ../lib/index.js is first required, and apply()
- * receives config.quotaFile — this suite never reads or writes ~/.dsh.
+ * ~/.dsh isolation: lib/ resolves nothing from $DSH_HOME (the quota store
+ * is gone with lib/quota.js); OPENCODE_ZEN_POOL_FILE is pinned into a temp
+ * dir BEFORE ../lib/index.js is first required — apply() receives no quota
+ * config; this suite never reads or writes ~/.dsh.
  * apply() registers only and fires a fire-and-forget health ping (Task 6):
  * no ctx.effect factories, no ctx.on listeners, and the gated autostart
  * spawns through the injected config.spawn seam — zen-router never runs.
@@ -80,7 +80,6 @@ const TEST_MODEL = 'mimo-v2.6-flash-free'
 const TEST_TMP = mkdtempSync(join(tmpdir(), 'dsh-opencode-zen-task1-'))
 if (!TEST_TMP.startsWith(tmpdir() + '/')) throw new Error(`refusing to operate outside the system temp dir: ${TEST_TMP}`)
 process.env.OPENCODE_ZEN_POOL_FILE = join(TEST_TMP, 'pool-config.json')
-const QUOTA_FILE = join(TEST_TMP, 'quota.json')
 
 // Task 6 safety: the autostart gate stays OFF for the whole suite unless a
 // check flips OPENCODE_ZEN_AUTOSTART explicitly — no test may ever reach the
@@ -467,7 +466,7 @@ function loadAdapter(baseUrl, extraConfig = {}) {
   const plugin = require('../lib/index.js')
   assert.strictEqual(typeof plugin.apply, 'function', "the plugin must export cordis's apply(ctx, config)")
   const ctx = makeCtx()
-  plugin.apply(ctx, { quotaFile: QUOTA_FILE, ...extraConfig })
+  plugin.apply(ctx, { ...extraConfig })
   assert.strictEqual(ctx.registrations.length, 1, 'apply() must register exactly one adapter via ctx.llm.registerAdapter')
   const registration = ctx.registrations[0]
   assert.deepStrictEqual(registration.routes, [TEST_PROVIDER], "apply() must register routes ['opencode']")
@@ -732,7 +731,7 @@ async function run() {
 
   check('[Task 2] apply() registers only: zero ctx.effect factories, zero ctx.on listeners', () => {
     const ctx = makeCtx()
-    fixture.plugin.apply(ctx, { quotaFile: QUOTA_FILE })
+    fixture.plugin.apply(ctx, {})
     assert.strictEqual(ctx.registrations.length, 1, 'apply() must register exactly one adapter')
     assert.deepStrictEqual(ctx.registrations[0].routes, [TEST_PROVIDER])
     assert.deepStrictEqual(ctx.effectFactories, [],
