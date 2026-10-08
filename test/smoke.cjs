@@ -34,9 +34,9 @@
  * quota store from $DSH_HOME/state/... unless overridden. Both are pinned
  * into a temp dir BEFORE ../lib/index.js is first required, and apply()
  * receives config.quotaFile — this suite never reads or writes ~/.dsh.
- * apply()'s ctx.effect factories are recorded but never executed, so the
- * base implementation's globalThis.fetch patch stays dormant (Task 6 owns
- * apply()-side tests).
+ * apply() registers only and fires a fire-and-forget health ping (Task 6):
+ * no ctx.effect factories, no ctx.on listeners, and the gated autostart
+ * spawns through the injected config.spawn seam — zen-router never runs.
  *
  * Run: node test/smoke.cjs
  */
@@ -81,6 +81,11 @@ const TEST_TMP = mkdtempSync(join(tmpdir(), 'dsh-opencode-zen-task1-'))
 if (!TEST_TMP.startsWith(tmpdir() + '/')) throw new Error(`refusing to operate outside the system temp dir: ${TEST_TMP}`)
 process.env.OPENCODE_ZEN_POOL_FILE = join(TEST_TMP, 'pool-config.json')
 const QUOTA_FILE = join(TEST_TMP, 'quota.json')
+
+// Task 6 safety: the autostart gate stays OFF for the whole suite unless a
+// check flips OPENCODE_ZEN_AUTOSTART explicitly — no test may ever reach the
+// default (real) zen-router spawner.
+delete process.env.OPENCODE_ZEN_AUTOSTART
 
 // ---------------------------------------------------------------- harness --
 let passed = 0
@@ -349,6 +354,10 @@ const STREAMS = {
 
 const server = http.createServer((req, res) => {
   res.on('error', () => {})
+  if (req.method === 'GET' && req.url === '/_zenctl/status') { // Task 6 health probe: control endpoint "up" — answered, never recorded (hits/last stay transport-only)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    return res.end('{}')
+  }
   let raw = ''
   req.on('data', (piece) => { raw += piece })
   req.on('end', () => {
@@ -403,6 +412,27 @@ async function closedPort() {
   return port
 }
 
+// --- Task 6 helpers: fire-and-forget ping settlement ------------------------
+const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function until(predicate, timeoutMs = 2000) { // poll until true — the ping resolves out-of-band of apply()
+  const deadline = Date.now() + timeoutMs
+  while (!predicate() && Date.now() < deadline) await settle(10)
+  return predicate()
+}
+
+async function withWarnCapture(fn) { // console.warn is Task 6's warning channel — capture it while fn (incl. settled pings) runs
+  const warnings = []
+  const original = console.warn
+  console.warn = (...args) => warnings.push(args.map(String).join(' '))
+  try { await fn() } finally { console.warn = original }
+  return warnings
+}
+
+function spawnRecorder(spawns) { // the injected config.spawn seam — records `zen-router up --detach`, never executes it
+  return (file, args) => spawns.push([file, ...args].join(' '))
+}
+
 // ---------------------------------------------------------- adapter load --
 // Each load re-reads OPENCODE_ZEN_BASE at module load (the base HEAD bakes
 // the transport-proxy default into a module-level const). The URL carries NO
@@ -421,23 +451,23 @@ function makeCtx() {
     // cordis effects install side effects — the base implementation patches
     // globalThis.fetch through ctx.effect. Record the factory and never run
     // it: every check stays hermetic and ~/.dsh-facing setup stays dormant
-    // (Task 6 owns apply()-side behavior).
+    // (Task 6 landed with zero effects — the pin below stays ZERO).
     effect(factory) { effectFactories.push(factory) },
     // Record subscribed events too: Task 2 proves apply() installs no
-    // listeners (the base hooked ctx.on('llm/stream')); Task 6 owns the
-    // apply()-side health listener when it arrives.
+    // listeners (the base hooked ctx.on('llm/stream')); Task 6 landed as a
+    // fire-and-forget health ping — still zero listeners (assertion below).
     on(event) { listeners.push(event) },
     get() { return undefined },
   }
 }
 
-function loadAdapter(baseUrl) {
+function loadAdapter(baseUrl, extraConfig = {}) {
   process.env.OPENCODE_ZEN_BASE = baseUrl
   delete require.cache[require.resolve('../lib/index.js')]
   const plugin = require('../lib/index.js')
   assert.strictEqual(typeof plugin.apply, 'function', "the plugin must export cordis's apply(ctx, config)")
   const ctx = makeCtx()
-  plugin.apply(ctx, { quotaFile: QUOTA_FILE })
+  plugin.apply(ctx, { quotaFile: QUOTA_FILE, ...extraConfig })
   assert.strictEqual(ctx.registrations.length, 1, 'apply() must register exactly one adapter via ctx.llm.registerAdapter')
   const registration = ctx.registrations[0]
   assert.deepStrictEqual(registration.routes, [TEST_PROVIDER], "apply() must register routes ['opencode']")
@@ -636,6 +666,7 @@ async function run() {
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(body)
     }
+    if (req.method === 'GET' && req.url === '/_zenctl/status') return json(200, '{}') // Task 6 health probe: control endpoint "up"
     if (req.method !== 'GET' || req.url !== '/v1/models') return json(404, '{"error":"not found"}')
     switch (modelsMode) {
       case 'fivehundred': return json(500, 'Internal server error')
@@ -1251,6 +1282,114 @@ async function run() {
   const downed = loadAdapter(`http://127.0.0.1:${deadPort}`).adapter
   await expectRow(downed, 'row 10: connection refused (down socket) → TRANSPORT, no status, no replay', {
     scenarioName: 'ok', request: false, expected: { code: 'TRANSPORT', status: 'absent', retryAfterMs: 'absent' }, chunks: [],
+  })
+
+  console.log('\n[Task 6 — apply() health ping + gated autostart]')
+
+  // Control endpoint UP: a dedicated loopback server answers GET
+  // /_zenctl/status with 200 — the ping must succeed and the (open) config
+  // gate must therefore spawn nothing. loadAdapter() asserts registration.
+  await checkAsync('[Task 6] control endpoint up (200) → ping fired, no spawn, no warning, adapter registered', async () => {
+    let controlHits = 0
+    const controlUp = http.createServer((req, res) => {
+      res.on('error', () => {})
+      if (req.method === 'GET' && req.url === '/_zenctl/status') {
+        controlHits += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end('{}')
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    await listen(controlUp)
+    try {
+      const spawns = []
+      const warnings = await withWarnCapture(async () => {
+        loadAdapter(`http://127.0.0.1:${controlUp.address().port}`, { autostart: true, spawn: spawnRecorder(spawns) })
+        await settle(400)
+      })
+      assert.strictEqual(controlHits, 1, 'apply() must ping GET /_zenctl/status exactly once against the configured base')
+      assert.deepStrictEqual(spawns, [], 'healthy control endpoint → the open gate must NOT spawn')
+      assert.deepStrictEqual(warnings, [], `healthy control endpoint → no health warning; got: ${JSON.stringify(warnings)}`)
+    } finally {
+      controlUp.closeAllConnections()
+      await new Promise((resolve) => controlUp.close(resolve))
+    }
+  })
+
+  // Control endpoint DOWN (closed loopback port) with the config gate open:
+  // warning + recorded spawn, and registration must have happened anyway
+  // (loadAdapter asserts it synchronously right after apply()).
+  await checkAsync('[Task 6] control down + config autostart → warning + recorded `zen-router up --detach`, adapter still registered', async () => {
+    const dead = await closedPort()
+    const spawns = []
+    let loaded
+    const warnings = await withWarnCapture(async () => {
+      loaded = loadAdapter(`http://127.0.0.1:${dead}`, { autostart: true, spawn: spawnRecorder(spawns) })
+      await until(() => spawns.length > 0)
+    })
+    assert.strictEqual(loaded.ctx.registrations.length, 1, 'registration must happen regardless of the ping result')
+    assert.deepStrictEqual(spawns, ['zen-router up --detach'], 'gated failure → exactly one `zen-router up --detach` spawn through the injected seam')
+    assert.ok(warnings.some((w) => w.includes('health check failed') && w.includes('/_zenctl/status')),
+      `failure must log a warning naming the ping; got: ${JSON.stringify(warnings)}`)
+  })
+
+  // Default gate OFF: warning yes, spawn never (daemon lifecycle stays
+  // zen-router's — spec non-goal), registration still immediate.
+  await checkAsync('[Task 6] control down, default (no gate) → warning, NO spawn, adapter still registered', async () => {
+    const dead = await closedPort()
+    const spawns = []
+    let loaded
+    const warnings = await withWarnCapture(async () => {
+      loaded = loadAdapter(`http://127.0.0.1:${dead}`, { spawn: spawnRecorder(spawns) })
+      await settle(400)
+    })
+    assert.strictEqual(loaded.ctx.registrations.length, 1, 'registration must happen regardless of the ping result')
+    assert.deepStrictEqual(spawns, [], 'without config.autostart / OPENCODE_ZEN_AUTOSTART the spawner must stay untouched')
+    assert.ok(warnings.some((w) => w.includes('health check failed')),
+      `failure must still warn when gated off; got: ${JSON.stringify(warnings)}`)
+  })
+
+  // The env half of the gate: OPENCODE_ZEN_AUTOSTART=1 with no config field.
+  await checkAsync('[Task 6] env gate OPENCODE_ZEN_AUTOSTART=1 → spawn recorded without the config field', async () => {
+    const dead = await closedPort()
+    const spawns = []
+    let loaded
+    process.env.OPENCODE_ZEN_AUTOSTART = '1'
+    try {
+      const warnings = await withWarnCapture(async () => {
+        loaded = loadAdapter(`http://127.0.0.1:${dead}`, { spawn: spawnRecorder(spawns) })
+        await until(() => spawns.length > 0)
+      })
+      assert.ok(warnings.some((w) => w.includes('health check failed')),
+        `failure must warn under the env gate too; got: ${JSON.stringify(warnings)}`)
+    } finally {
+      delete process.env.OPENCODE_ZEN_AUTOSTART
+    }
+    assert.strictEqual(loaded.ctx.registrations.length, 1, 'registration must happen regardless of the ping result')
+    assert.deepStrictEqual(spawns, ['zen-router up --detach'], 'env gate → `zen-router up --detach` recorded through the injected seam')
+  })
+
+  // Registration is synchronous and happens BEFORE the ping settles: with a
+  // control endpoint that never answers, the adapter is already registered
+  // while the ping is pending; aborting the socket counts as ping failure.
+  await checkAsync('[Task 6] ping hangs → registration already complete before it settles; abort → gated spawn', async () => {
+    const hang = http.createServer(() => { /* never answers — AbortSignal.timeout owns the pending ping */ })
+    await listen(hang)
+    const spawns = []
+    try {
+      await withWarnCapture(async () => {
+        const loaded = loadAdapter(`http://127.0.0.1:${hang.address().port}`, { autostart: true, spawn: spawnRecorder(spawns) })
+        assert.strictEqual(loaded.ctx.registrations.length, 1, 'registration is synchronous — complete while the ping is still pending')
+        assert.deepStrictEqual(spawns, [], 'the ping is pending — no failure decision yet')
+        hang.closeAllConnections() // abort the pending ping
+        await until(() => spawns.length > 0)
+      })
+    } finally {
+      hang.closeAllConnections()
+      await new Promise((resolve) => hang.close(resolve))
+    }
+    assert.deepStrictEqual(spawns, ['zen-router up --detach'], 'aborted ping = failure → gated spawn recorded')
   })
 
   await new Promise((resolve) => {
